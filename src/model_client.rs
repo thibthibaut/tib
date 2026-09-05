@@ -10,6 +10,17 @@ pub struct ToolCallRequest {
     pub command: String,
 }
 
+/// The role a [`ContextMessage`] is tagged with, per `CONTEXT.md`'s glossary.
+/// Shared by the transcript pane and the context dot-grid so both use the
+/// same role→color mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    System,
+    User,
+    Assistant,
+    Tool,
+}
+
 /// One message in a [`Context`], tagged by role per `CONTEXT.md`'s glossary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContextMessage {
@@ -23,6 +34,38 @@ pub enum ContextMessage {
         tool_call_id: String,
         content: String,
     },
+}
+
+impl ContextMessage {
+    #[must_use]
+    pub const fn role(&self) -> Role {
+        match self {
+            Self::System(_) => Role::System,
+            Self::User(_) => Role::User,
+            Self::Assistant { .. } => Role::Assistant,
+            Self::ToolResult { .. } => Role::Tool,
+        }
+    }
+
+    /// The text used to display this message in the transcript pane, and to
+    /// estimate its token count (see `token_heuristic`).
+    #[must_use]
+    pub fn display_text(&self) -> String {
+        match self {
+            Self::System(text) | Self::User(text) => text.clone(),
+            Self::Assistant { text, tool_calls } => {
+                let mut lines = Vec::new();
+                if let Some(text) = text {
+                    lines.push(text.clone());
+                }
+                for tool_call in tool_calls {
+                    lines.push(format!("→ bash: {}", tool_call.command));
+                }
+                lines.join("\n")
+            }
+            Self::ToolResult { content, .. } => content.clone(),
+        }
+    }
 }
 
 /// The full ordered set of messages that will be sent to the model on the

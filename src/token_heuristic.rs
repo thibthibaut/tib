@@ -1,0 +1,167 @@
+//! Per-message token estimates for the Context Visualization, scaled to
+//! match `OpenRouter`'s last authoritative `usage.total_tokens` (ADR-0004).
+//!
+//! Each message's raw estimate is `chars / 4`; estimates are then scaled so
+//! their sum equals `total_tokens` exactly, with any rounding remainder
+//! folded into the last message so the total never drifts.
+
+use crate::model_client::{Context, Role};
+
+/// One message's role and its scaled token estimate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MessageTokens {
+    pub role: Role,
+    pub tokens: u32,
+}
+
+fn char_estimate(text: &str) -> u64 {
+    let chars = u64::try_from(text.chars().count()).unwrap_or(u64::MAX);
+    chars.checked_div(4).unwrap_or(0)
+}
+
+/// Splits `total` evenly across `count` slots: an even distribution is what
+/// `scale_to_total` produces when every slot's raw estimate is equal.
+fn distribute_evenly(total: u64, count: usize) -> Vec<u64> {
+    if count == 0 {
+        return Vec::new();
+    }
+    let count_u64 = u64::try_from(count).unwrap_or(u64::MAX);
+    scale_to_total(&vec![1; count], count_u64, total)
+}
+
+/// Scales each raw estimate proportionally to `raw`'s share of `raw_sum` out
+/// of `total`, folding the rounding remainder into the last slot.
+fn scale_to_total(raw: &[u64], raw_sum: u64, total: u64) -> Vec<u64> {
+    let mut scaled: Vec<u64> = raw
+        .iter()
+        .map(|value| {
+            value
+                .saturating_mul(total)
+                .checked_div(raw_sum)
+                .unwrap_or(0)
+        })
+        .collect();
+    let assigned: u64 = scaled.iter().sum();
+    let remainder = total.saturating_sub(assigned);
+    if let Some(last) = scaled.last_mut() {
+        *last = last.saturating_add(remainder);
+    }
+    scaled
+}
+
+/// Estimates a per-message token count for each message in `context`, scaled
+/// so the estimates sum to exactly `total_tokens`. Returns an empty `Vec` for
+/// an empty context.
+#[must_use]
+pub fn scaled_message_tokens(context: &Context, total_tokens: u32) -> Vec<MessageTokens> {
+    if context.messages.is_empty() {
+        return Vec::new();
+    }
+
+    let raw: Vec<u64> = context
+        .messages
+        .iter()
+        .map(|message| char_estimate(&message.display_text()))
+        .collect();
+    let raw_sum: u64 = raw.iter().sum();
+    let total = u64::from(total_tokens);
+
+    let scaled = if raw_sum == 0 {
+        distribute_evenly(total, raw.len())
+    } else {
+        scale_to_total(&raw, raw_sum, total)
+    };
+
+    context
+        .messages
+        .iter()
+        .zip(scaled)
+        .map(|(message, tokens)| MessageTokens {
+            role: message.role(),
+            tokens: u32::try_from(tokens).unwrap_or(u32::MAX),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model_client::ContextMessage;
+
+    fn context_of(messages: Vec<ContextMessage>) -> Context {
+        Context { messages }
+    }
+
+    #[test]
+    fn empty_context_produces_no_message_tokens() {
+        let context = context_of(Vec::new());
+
+        assert_eq!(scaled_message_tokens(&context, 100), Vec::new());
+    }
+
+    #[test]
+    fn single_message_gets_the_entire_total() {
+        let context = context_of(vec![ContextMessage::User("hello there".to_string())]);
+
+        let tokens = scaled_message_tokens(&context, 42);
+
+        assert_eq!(
+            tokens,
+            vec![MessageTokens {
+                role: Role::User,
+                tokens: 42
+            }]
+        );
+    }
+
+    #[test]
+    fn estimates_split_proportionally_to_message_length_and_sum_to_the_total() {
+        // "aaaaaaaa" (8 chars) is twice the raw estimate of "aaaa" (4 chars).
+        let context = context_of(vec![
+            ContextMessage::System("aaaa".to_string()),
+            ContextMessage::User("aaaaaaaa".to_string()),
+        ]);
+
+        let tokens = scaled_message_tokens(&context, 90);
+
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].role, Role::System);
+        assert_eq!(tokens[1].role, Role::User);
+        assert_eq!(tokens[0].tokens, 30);
+        assert_eq!(tokens[1].tokens, 60);
+        let sum: u32 = tokens.iter().map(|message| message.tokens).sum();
+        assert_eq!(sum, 90);
+    }
+
+    #[test]
+    fn zero_heuristic_sum_falls_back_to_an_even_split_without_panicking() {
+        // Every message estimates to zero raw tokens (fewer than 4 chars
+        // each), so the proportional split would divide by zero.
+        let context = context_of(vec![
+            ContextMessage::System(String::new()),
+            ContextMessage::User("ab".to_string()),
+            ContextMessage::Assistant {
+                text: Some("cd".to_string()),
+                tool_calls: Vec::new(),
+            },
+        ]);
+
+        let tokens = scaled_message_tokens(&context, 10);
+
+        let sum: u32 = tokens.iter().map(|message| message.tokens).sum();
+        assert_eq!(sum, 10);
+        assert_eq!(tokens.len(), 3);
+    }
+
+    #[test]
+    fn zero_total_tokens_produces_all_zero_estimates() {
+        let context = context_of(vec![
+            ContextMessage::System("aaaa".to_string()),
+            ContextMessage::User("aaaaaaaa".to_string()),
+        ]);
+
+        let tokens = scaled_message_tokens(&context, 0);
+
+        assert!(tokens.iter().all(|message| message.tokens == 0));
+    }
+}

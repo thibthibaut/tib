@@ -9,7 +9,7 @@ use eyre::Result;
 
 use crate::bash_tool::{BashOutput, run_bash_command};
 use crate::config::Config;
-use crate::model_client::{Context, ContextMessage, ModelClient, ToolCallRequest};
+use crate::model_client::{Context, ContextMessage, ModelClient, ToolCallRequest, Usage};
 
 /// The captured result of running one requested Bash tool call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,12 +44,16 @@ fn format_tool_result(output: &BashOutput) -> String {
 }
 
 /// The single, ephemeral conversation between the user and the model.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Session {
     pub context: Context,
     pub state: SessionState,
     pub step_count: u32,
     pub tool_call_count: u32,
+    /// [`Usage`] from the most recently completed [`ModelClient::complete`]
+    /// call. The Context Visualization's token total lags by one step
+    /// because it's only known once a response has completed (ADR-0004).
+    pub last_usage: Option<Usage>,
 }
 
 impl Session {
@@ -62,6 +66,7 @@ impl Session {
             state: SessionState::AwaitingUserInput,
             step_count: 0,
             tool_call_count: 0,
+            last_usage: None,
         }
     }
 
@@ -104,6 +109,7 @@ impl Session {
             };
 
             let response = client.complete(&self.context).await?;
+            self.last_usage = Some(response.usage);
             self.context.push(ContextMessage::Assistant {
                 text: response.text,
                 tool_calls: response.tool_calls.clone(),
