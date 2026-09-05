@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use eyre::{Result, WrapErr};
+use eyre::Result;
 
 use crate::bash_tool::{BashOutput, run_bash_command};
 use crate::config::Config;
@@ -68,12 +68,14 @@ impl Session {
     /// Pushes `user_message` onto the context, then drives the loop forward:
     /// calling `client` and executing any requested Bash tool calls for
     /// real, until a step's response contains no tool calls or
-    /// `config.max_steps` is reached. Returns to
-    /// [`SessionState::AwaitingUserInput`] either way, even on error.
+    /// `config.max_steps` (a whole-session budget, not a per-message one) is
+    /// reached. Returns to [`SessionState::AwaitingUserInput`] either way,
+    /// even on error.
     ///
     /// # Errors
     ///
-    /// Returns an error if `client` or a Bash tool call fails.
+    /// Returns an error if the session has already spent its whole
+    /// `config.max_steps` budget, or if `client` fails.
     pub async fn send_user_message<C: ModelClient + Sync>(
         &mut self,
         user_message: String,
@@ -92,6 +94,13 @@ impl Session {
         client: &C,
         config: &Config,
     ) -> Result<()> {
+        if self.step_count >= config.max_steps {
+            return Err(eyre::eyre!(
+                "session already spent its step budget (max_steps = {})",
+                config.max_steps
+            ));
+        }
+
         while self.step_count < config.max_steps {
             self.step_count = self.step_count.saturating_add(1);
             self.state = SessionState::CallingModel {
@@ -125,15 +134,24 @@ impl Session {
                 let command = tool_call.command.clone();
                 let timeout = Duration::from_secs(config.tool_timeout_seconds);
                 let truncate_limit = config.tool_output_truncate_chars;
-                let output = tokio::task::spawn_blocking(move || {
+                // Every tool_call in the assistant message already pushed to
+                // context (above) needs a matching ToolResult, or the next
+                // request sends OpenRouter an unanswered tool call and gets
+                // rejected. So a failure here becomes the result's content
+                // instead of aborting the batch via `?`.
+                let content = match tokio::task::spawn_blocking(move || {
                     run_bash_command(&command, timeout, truncate_limit)
                 })
                 .await
-                .wrap_err("bash tool task panicked")??;
+                {
+                    Ok(Ok(output)) => format_tool_result(&output),
+                    Ok(Err(error)) => format!("error running command: {error}"),
+                    Err(join_error) => format!("bash tool task panicked: {join_error}"),
+                };
 
                 let result = ToolResult {
                     tool_call_id: tool_call.id.clone(),
-                    content: format_tool_result(&output),
+                    content,
                 };
                 self.context.push(ContextMessage::ToolResult {
                     tool_call_id: result.tool_call_id.clone(),
@@ -323,5 +341,26 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(session.state, SessionState::AwaitingUserInput);
+    }
+
+    #[tokio::test]
+    async fn a_further_message_errors_once_the_sessions_whole_step_budget_is_spent() {
+        let client =
+            FakeModelClient::new(vec![text_response("done"), text_response("unreachable")]);
+        let config = test_config(1);
+        let mut session = Session::new("system prompt");
+
+        session
+            .send_user_message("first".to_string(), &client, &config)
+            .await
+            .unwrap();
+
+        let result = session
+            .send_user_message("second".to_string(), &client, &config)
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(session.state, SessionState::AwaitingUserInput);
+        assert_eq!(session.step_count, 1);
     }
 }
