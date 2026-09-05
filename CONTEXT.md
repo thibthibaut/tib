@@ -17,7 +17,7 @@ One full round-trip to the model: send the current context, receive one response
 _Avoid_: turn, round-trip, iteration
 
 **Tool Call**:
-A single execution of the Bash tool that the model requested within a step. A step may trigger zero or more tool calls; the running total of tool calls is tracked separately from the step count and is never capped.
+A single execution of the Bash tool that the model requested within a step. A step may trigger zero or more tool calls; the running total of tool calls is tracked separately from the step count and is never capped. Unlike the step count, this total accumulates for the whole session and is never reset between user messages.
 _Avoid_: action, invocation, tool execution
 
 **Context Visualization**:
