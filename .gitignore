@@ -1,0 +1,11 @@
+/target
+
+# devenv
+.devenv*
+devenv.local.nix
+
+# direnv
+.direnv
+
+# git-hooks.nix (auto-generated)
+.pre-commit-config.yaml
