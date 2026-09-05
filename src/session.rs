@@ -68,14 +68,15 @@ impl Session {
     /// Pushes `user_message` onto the context, then drives the loop forward:
     /// calling `client` and executing any requested Bash tool calls for
     /// real, until a step's response contains no tool calls or
-    /// `config.max_steps` (a whole-session budget, not a per-message one) is
-    /// reached. Returns to [`SessionState::AwaitingUserInput`] either way,
-    /// even on error.
+    /// `config.max_steps` — this turn's budget, reset at the start of every
+    /// call — is reached. Returns to [`SessionState::AwaitingUserInput`]
+    /// either way, even on error.
     ///
     /// # Errors
     ///
-    /// Returns an error if the session has already spent its whole
-    /// `config.max_steps` budget, or if `client` fails.
+    /// Returns an error if `client` fails. A failing Bash tool call does not
+    /// error the turn: its failure becomes that tool call's result content
+    /// instead, so every `tool_call` still gets a matching result.
     pub async fn send_user_message<C: ModelClient + Sync>(
         &mut self,
         user_message: String,
@@ -94,12 +95,7 @@ impl Session {
         client: &C,
         config: &Config,
     ) -> Result<()> {
-        if self.step_count >= config.max_steps {
-            return Err(eyre::eyre!(
-                "session already spent its step budget (max_steps = {})",
-                config.max_steps
-            ));
-        }
+        self.step_count = 0;
 
         while self.step_count < config.max_steps {
             self.step_count = self.step_count.saturating_add(1);
@@ -344,9 +340,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_further_message_errors_once_the_sessions_whole_step_budget_is_spent() {
-        let client =
-            FakeModelClient::new(vec![text_response("done"), text_response("unreachable")]);
+    async fn max_steps_is_a_fresh_budget_for_every_turn_not_a_session_lifetime_total() {
+        let client = FakeModelClient::new(vec![
+            text_response("first done"),
+            text_response("second done"),
+        ]);
         let config = test_config(1);
         let mut session = Session::new("system prompt");
 
@@ -354,12 +352,13 @@ mod tests {
             .send_user_message("first".to_string(), &client, &config)
             .await
             .unwrap();
+        assert_eq!(session.step_count, 1);
 
-        let result = session
+        session
             .send_user_message("second".to_string(), &client, &config)
-            .await;
+            .await
+            .unwrap();
 
-        assert!(result.is_err());
         assert_eq!(session.state, SessionState::AwaitingUserInput);
         assert_eq!(session.step_count, 1);
     }
