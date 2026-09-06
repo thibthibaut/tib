@@ -77,6 +77,9 @@ impl Session {
     /// call — is reached. Returns to [`SessionState::AwaitingUserInput`]
     /// either way, even on error.
     ///
+    /// `on_update` is called with each step's assistant text accumulated so
+    /// far as it streams in (see [`ModelClient::complete_streaming`]).
+    ///
     /// # Errors
     ///
     /// Returns an error if `client` fails. A failing Bash tool call does not
@@ -87,10 +90,11 @@ impl Session {
         user_message: String,
         client: &C,
         config: &Config,
+        on_update: impl FnMut(&str) + Send,
     ) -> Result<()> {
         self.context.push(ContextMessage::User(user_message));
 
-        let result = self.run_steps(client, config).await;
+        let result = self.run_steps(client, config, on_update).await;
         self.state = SessionState::AwaitingUserInput;
         result
     }
@@ -99,6 +103,7 @@ impl Session {
         &mut self,
         client: &C,
         config: &Config,
+        mut on_update: impl FnMut(&str) + Send,
     ) -> Result<()> {
         self.step_count = 0;
 
@@ -108,7 +113,9 @@ impl Session {
                 step: self.step_count,
             };
 
-            let response = client.complete(&self.context).await?;
+            let response = client
+                .complete_streaming(&self.context, &mut on_update)
+                .await?;
             self.last_usage = Some(response.usage);
             self.context.push(ContextMessage::Assistant {
                 text: response.text,
@@ -254,7 +261,7 @@ mod tests {
         let mut session = Session::new("system prompt");
 
         session
-            .send_user_message("hello".to_string(), &client, &config)
+            .send_user_message("hello".to_string(), &client, &config, |_delta: &str| {})
             .await
             .unwrap();
 
@@ -273,7 +280,12 @@ mod tests {
         let mut session = Session::new("system prompt");
 
         session
-            .send_user_message("run something".to_string(), &client, &config)
+            .send_user_message(
+                "run something".to_string(),
+                &client,
+                &config,
+                |_delta: &str| {},
+            )
             .await
             .unwrap();
 
@@ -303,7 +315,12 @@ mod tests {
         let mut session = Session::new("system prompt");
 
         session
-            .send_user_message("run two things".to_string(), &client, &config)
+            .send_user_message(
+                "run two things".to_string(),
+                &client,
+                &config,
+                |_delta: &str| {},
+            )
             .await
             .unwrap();
 
@@ -322,7 +339,12 @@ mod tests {
         let mut session = Session::new("system prompt");
 
         session
-            .send_user_message("keep going".to_string(), &client, &config)
+            .send_user_message(
+                "keep going".to_string(),
+                &client,
+                &config,
+                |_delta: &str| {},
+            )
             .await
             .unwrap();
 
@@ -338,7 +360,7 @@ mod tests {
         let mut session = Session::new("system prompt");
 
         let result = session
-            .send_user_message("hello".to_string(), &client, &config)
+            .send_user_message("hello".to_string(), &client, &config, |_delta: &str| {})
             .await;
 
         assert!(result.is_err());
@@ -355,17 +377,41 @@ mod tests {
         let mut session = Session::new("system prompt");
 
         session
-            .send_user_message("first".to_string(), &client, &config)
+            .send_user_message("first".to_string(), &client, &config, |_delta: &str| {})
             .await
             .unwrap();
         assert_eq!(session.step_count, 1);
 
         session
-            .send_user_message("second".to_string(), &client, &config)
+            .send_user_message("second".to_string(), &client, &config, |_delta: &str| {})
             .await
             .unwrap();
 
         assert_eq!(session.state, SessionState::AwaitingUserInput);
         assert_eq!(session.step_count, 1);
+    }
+
+    #[tokio::test]
+    async fn on_update_is_called_once_per_step_with_the_step_s_full_text() {
+        // FakeModelClient never overrides `complete_streaming`, so this
+        // exercises the trait's default implementation end to end.
+        let client = FakeModelClient::new(vec![
+            tool_call_response(&[("call_1", "echo one")]),
+            text_response("done"),
+        ]);
+        let config = test_config(10);
+        let mut session = Session::new("system prompt");
+        let deltas = Mutex::new(Vec::new());
+
+        session
+            .send_user_message("run something".to_string(), &client, &config, |delta| {
+                deltas.lock().unwrap().push(delta.to_string());
+            })
+            .await
+            .unwrap();
+
+        // Step 1's response is tool-calls-only (no text), so it contributes
+        // no delta; step 2's "done" contributes exactly one.
+        assert_eq!(deltas.into_inner().unwrap(), vec!["done".to_string()]);
     }
 }

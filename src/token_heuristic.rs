@@ -49,6 +49,22 @@ fn scale_to_total(raw: &[u64], raw_sum: u64, total: u64) -> Vec<u64> {
     scaled
 }
 
+/// The number of empty dots the Context Visualization should draw for unused capacity.
+///
+/// Computed as `context_length`'s budget minus `used_tokens` already spent,
+/// at the same ~1000-tokens-per-dot scale as the used dots. Returns `0` if
+/// `context_length` is unknown or `used_tokens` has already reached it.
+#[must_use]
+pub fn free_dots(context_length: Option<u32>, used_tokens: u32) -> u32 {
+    let Some(context_length) = context_length else {
+        return 0;
+    };
+    context_length
+        .saturating_sub(used_tokens)
+        .checked_div(1000)
+        .unwrap_or(0)
+}
+
 /// Estimates a per-message token count for each message in `context`, scaled
 /// so the estimates sum to exactly `total_tokens`. Returns an empty `Vec` for
 /// an empty context.
@@ -151,6 +167,21 @@ mod tests {
         let sum: u32 = tokens.iter().map(|message| message.tokens).sum();
         assert_eq!(sum, 10);
         assert_eq!(tokens.len(), 3);
+    }
+
+    #[test]
+    fn free_dots_is_zero_when_context_length_is_unknown() {
+        assert_eq!(free_dots(None, 500), 0);
+    }
+
+    #[test]
+    fn free_dots_scales_remaining_capacity_at_1000_tokens_per_dot() {
+        assert_eq!(free_dots(Some(10_000), 3_400), 6);
+    }
+
+    #[test]
+    fn free_dots_is_zero_rather_than_negative_when_used_exceeds_context_length() {
+        assert_eq!(free_dots(Some(1_000), 5_000), 0);
     }
 
     #[test]

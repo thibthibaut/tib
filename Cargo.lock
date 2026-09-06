@@ -2336,6 +2336,7 @@ dependencies = [
  "color-eyre",
  "crossterm",
  "eyre",
+ "futures-util",
  "libc",
  "openrouter-rs",
  "ratatui",

@@ -11,8 +11,8 @@ pub struct ToolCallRequest {
 }
 
 /// The role a [`ContextMessage`] is tagged with, per `CONTEXT.md`'s glossary.
-/// Shared by the transcript pane and the context dot-grid so both use the
-/// same role→color mapping.
+/// Shared by the transcript pane and the Context Visualization so both use
+/// the same role→color mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     System,
@@ -110,4 +110,31 @@ pub trait ModelClient {
     /// Returns an error if the underlying request fails or the response
     /// can't be interpreted as a [`ModelResponse`].
     async fn complete(&self, context: &Context) -> Result<ModelResponse>;
+
+    /// Like [`complete`](Self::complete), but calls `on_update` with the
+    /// assistant text accumulated so far for the current step, each time
+    /// more of it arrives — a caller renders the reply incrementally by
+    /// replacing its display buffer with each call's argument, not
+    /// appending to it. Tool calls are never streamed piecemeal: they only
+    /// appear, fully formed, in the returned [`ModelResponse`].
+    ///
+    /// The default implementation calls `complete` and reports its whole
+    /// text in a single call, so implementers that don't support streaming
+    /// (and tests using a scripted client) get correct, if non-incremental,
+    /// behavior for free.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error under the same conditions as `complete`.
+    async fn complete_streaming(
+        &self,
+        context: &Context,
+        mut on_update: impl FnMut(&str) + Send,
+    ) -> Result<ModelResponse> {
+        let response = self.complete(context).await?;
+        if let Some(text) = &response.text {
+            on_update(text);
+        }
+        Ok(response)
+    }
 }

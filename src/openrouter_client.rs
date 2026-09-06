@@ -2,10 +2,15 @@
 //! The Bash tool's JSON schema is hardcoded here, since it never varies.
 
 use eyre::{Result, WrapErr};
+use futures_util::StreamExt;
 use openrouter_rs::{
     OpenRouterClient as RealClient,
-    api::chat::{ChatCompletionRequest, Message},
-    types::{Role, Tool, ToolCall},
+    api::chat::{ChatCompletionRequest, Message, StreamOptions},
+    types::{
+        Role, Tool, ToolCall,
+        completion::{FinishReason, ResponseUsage},
+        stream::StreamEvent,
+    },
 };
 use serde_json::{Value, json};
 
@@ -58,6 +63,19 @@ fn to_openrouter_message(message: &ContextMessage) -> Message {
     }
 }
 
+fn to_usage(usage: Option<ResponseUsage>) -> Usage {
+    usage.map_or(
+        Usage {
+            total_tokens: 0,
+            cost: 0.0,
+        },
+        |usage| Usage {
+            total_tokens: usage.total_tokens,
+            cost: usage.cost.unwrap_or(0.0),
+        },
+    )
+}
+
 fn from_openrouter_tool_call(tool_call: &ToolCall) -> Result<ToolCallRequest> {
     let arguments: Value = serde_json::from_str(&tool_call.function.arguments)
         .wrap_err("model requested the bash tool with arguments that are not valid JSON")?;
@@ -103,6 +121,38 @@ impl OpenRouterClient {
             model: model.into(),
         })
     }
+
+    /// Fetches the configured model's context window size in tokens, for the
+    /// Context Visualization's free-dot display. Returns `Ok(None)` if the
+    /// model slug isn't in `OpenRouter`'s `author/slug` shape, or if the
+    /// model's metadata doesn't report a context length.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying request fails.
+    pub async fn context_length(&self) -> Result<Option<u32>> {
+        let Some((author, slug)) = self.model.split_once('/') else {
+            return Ok(None);
+        };
+        let model = self
+            .client
+            .models()
+            .get(author, slug)
+            .await
+            .wrap_err("failed to fetch model metadata from OpenRouter")?;
+
+        // f64 has no checked/fallible conversion to u32 in std; clamping
+        // into u32's range first makes the truncating, non-negative cast safe.
+        #[allow(
+            clippy::as_conversions,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        let context_length = model
+            .context_length
+            .map(|length| length.clamp(0.0, f64::from(u32::MAX)).round() as u32);
+        Ok(context_length)
+    }
 }
 
 impl ModelClient for OpenRouterClient {
@@ -136,7 +186,10 @@ impl ModelClient for OpenRouterClient {
             ));
         }
 
-        let text = choice.content().map(str::to_string);
+        let text = choice
+            .content()
+            .map(str::to_string)
+            .filter(|text| !text.is_empty());
         let tool_calls = choice
             .tool_calls()
             .unwrap_or_default()
@@ -144,22 +197,94 @@ impl ModelClient for OpenRouterClient {
             .map(from_openrouter_tool_call)
             .collect::<Result<Vec<_>>>()?;
 
-        let usage = response.usage.map_or(
-            Usage {
-                total_tokens: 0,
-                cost: 0.0,
-            },
-            |usage| Usage {
-                total_tokens: usage.total_tokens,
-                cost: usage.cost.unwrap_or(0.0),
-            },
-        );
-
         Ok(ModelResponse {
             text,
             tool_calls,
-            usage,
+            usage: to_usage(response.usage),
         })
+    }
+
+    async fn complete_streaming(
+        &self,
+        context: &Context,
+        mut on_update: impl FnMut(&str) + Send,
+    ) -> Result<ModelResponse> {
+        let messages: Vec<Message> = context.messages.iter().map(to_openrouter_message).collect();
+
+        // `StreamOptions` is `#[non_exhaustive]`, so it's built via its
+        // (derived) `Default` plus a field assignment rather than a struct
+        // literal. Without this, OpenRouter omits `usage` from the final
+        // chunk entirely, silently zeroing cost/token accounting for every
+        // streamed step (ADR-0004's per-role token counts included).
+        let mut stream_options = StreamOptions::default();
+        stream_options.include_usage = Some(true);
+
+        let request = ChatCompletionRequest::builder()
+            .model(self.model.clone())
+            .messages(messages)
+            .tools(vec![bash_tool()])
+            .tool_choice_auto()
+            .stream_options(stream_options)
+            .build()
+            .wrap_err("failed to build chat completion request")?;
+
+        let mut stream = self
+            .client
+            .chat()
+            .stream_tool_aware(&request)
+            .await
+            .wrap_err("OpenRouter streaming chat completion request failed")?;
+
+        let mut text = String::new();
+        while let Some(event) = stream.next().await {
+            match event {
+                StreamEvent::ContentDelta(delta) => {
+                    text.push_str(&delta);
+                    // Passes the text accumulated so far this step (not just
+                    // `delta`), so a caller can render by replacing its
+                    // display buffer rather than appending — which also
+                    // means a new step naturally starts from a fresh string
+                    // instead of concatenating onto the previous step's text.
+                    on_update(&text);
+                }
+                StreamEvent::Done {
+                    tool_calls,
+                    usage,
+                    finish_reason,
+                    ..
+                } => {
+                    // `ToolAwareStream` doesn't surface per-choice provider
+                    // errors the way `complete`'s `choice.error()` check
+                    // does, but an error/content-filter finish reason is
+                    // still visible here and shouldn't be treated as a
+                    // normal, silent completion.
+                    if matches!(
+                        finish_reason,
+                        Some(FinishReason::Error | FinishReason::ContentFilter)
+                    ) {
+                        return Err(eyre::eyre!(
+                            "OpenRouter stream finished with reason {finish_reason:?} rather than a normal stop"
+                        ));
+                    }
+                    let tool_calls = tool_calls
+                        .iter()
+                        .map(from_openrouter_tool_call)
+                        .collect::<Result<Vec<_>>>()?;
+                    return Ok(ModelResponse {
+                        text: (!text.is_empty()).then_some(text),
+                        tool_calls,
+                        usage: to_usage(usage),
+                    });
+                }
+                StreamEvent::Error(error) => {
+                    return Err(eyre::eyre!("OpenRouter stream reported an error: {error}"));
+                }
+                // Reasoning content and any future variants aren't shown.
+                _ => {}
+            }
+        }
+
+        Err(eyre::eyre!("OpenRouter stream ended without a Done event"))
     }
 }
 
