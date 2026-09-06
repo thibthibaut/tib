@@ -13,7 +13,7 @@ use ratatui::widgets::{
 use tib::config::Config;
 use tib::model_client::Role;
 use tib::session::{Session, SessionState};
-use tib::token_heuristic::{free_dots, scaled_message_tokens};
+use tib::token_heuristic::{context_percent_used, free_dots, scaled_message_tokens};
 
 /// A colored marker drawn at the start of every line of a message, so
 /// adjacent messages read as distinct sections without recoloring their text
@@ -168,9 +168,12 @@ fn info_lines(
         .last_usage
         .map_or_else(|| "n/a".to_string(), |usage| format!("${:.4}", usage.cost));
     let total_tokens = session.last_usage.map_or(0, |usage| usage.total_tokens);
+    let percent_used = context_percent_used(context_length, total_tokens)
+        .map_or_else(|| "?%".to_string(), |percent| format!("{percent}%"));
 
     let mut lines = vec![
         Line::from(format!("model: {}", config.model)),
+        Line::from(format!("turn: {}", session.context.turn_count())),
         Line::from(format!("step: {}/{}", session.step_count, config.max_steps)),
         Line::from(format!("tool calls: {}", session.tool_call_count)),
         Line::from(format!("last call cost: {cost}")),
@@ -183,7 +186,9 @@ fn info_lines(
             format!("state: {}", state_label(&session.state))
         }),
         Line::from(""),
-        Line::from(format!("context (~{total_tokens} tokens):")),
+        Line::from(format!(
+            "context (~{total_tokens} tokens, {percent_used} used):"
+        )),
     ];
     lines.push(Line::from(context_visualization_spans(
         session,

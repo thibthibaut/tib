@@ -33,14 +33,25 @@ pub enum SessionState {
     },
 }
 
+/// Formats one Bash tool call's result. `stdout`/`stderr` sections are
+/// omitted entirely when empty, rather than shown as empty-bodied headers,
+/// so a command that only writes to one stream doesn't pad the transcript
+/// (and the model's context) with a section that says nothing.
 fn format_tool_result(output: &BashOutput) -> String {
     let exit_code = output
         .exit_code
         .map_or_else(|| "none".to_string(), |code| code.to_string());
-    format!(
-        "exit_code: {exit_code}\ntimed_out: {}\nstdout:\n{}\nstderr:\n{}",
-        output.timed_out, output.stdout, output.stderr
-    )
+    let mut sections = vec![
+        format!("exit_code: {exit_code}"),
+        format!("timed_out: {}", output.timed_out),
+    ];
+    if !output.stdout.is_empty() {
+        sections.push(format!("stdout:\n{}", output.stdout));
+    }
+    if !output.stderr.is_empty() {
+        sections.push(format!("stderr:\n{}", output.stderr));
+    }
+    sections.join("\n")
 }
 
 /// The single, ephemeral conversation between the user and the model.
@@ -183,6 +194,51 @@ mod tests {
     use super::*;
     use crate::model_client::{ModelResponse, Usage};
     use std::sync::Mutex;
+
+    fn bash_output(stdout: &str, stderr: &str) -> BashOutput {
+        BashOutput {
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+            exit_code: Some(0),
+            timed_out: false,
+        }
+    }
+
+    #[test]
+    fn format_tool_result_omits_stdout_and_stderr_when_both_are_empty() {
+        let formatted = format_tool_result(&bash_output("", ""));
+
+        assert_eq!(formatted, "exit_code: 0\ntimed_out: false");
+    }
+
+    #[test]
+    fn format_tool_result_includes_stdout_only_when_stderr_is_empty() {
+        let formatted = format_tool_result(&bash_output("hello\n", ""));
+
+        assert_eq!(
+            formatted,
+            "exit_code: 0\ntimed_out: false\nstdout:\nhello\n"
+        );
+        assert!(!formatted.contains("stderr"));
+    }
+
+    #[test]
+    fn format_tool_result_includes_stderr_only_when_stdout_is_empty() {
+        let formatted = format_tool_result(&bash_output("", "oops\n"));
+
+        assert_eq!(formatted, "exit_code: 0\ntimed_out: false\nstderr:\noops\n");
+        assert!(!formatted.contains("stdout"));
+    }
+
+    #[test]
+    fn format_tool_result_includes_both_when_both_are_present() {
+        let formatted = format_tool_result(&bash_output("hello\n", "oops\n"));
+
+        assert_eq!(
+            formatted,
+            "exit_code: 0\ntimed_out: false\nstdout:\nhello\n\nstderr:\noops\n"
+        );
+    }
 
     fn test_config(max_steps: u32) -> Config {
         Config {

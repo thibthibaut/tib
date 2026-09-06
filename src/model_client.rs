@@ -79,6 +79,17 @@ impl Context {
     pub fn push(&mut self, message: ContextMessage) {
         self.messages.push(message);
     }
+
+    /// The number of Turns so far, per `CONTEXT.md`'s glossary: one per
+    /// `User` message, since `Session::send_user_message` pushes exactly one
+    /// onto the context at the start of every Turn.
+    #[must_use]
+    pub fn turn_count(&self) -> usize {
+        self.messages
+            .iter()
+            .filter(|message| matches!(message, ContextMessage::User(_)))
+            .count()
+    }
 }
 
 /// Token and cost accounting for one [`ModelClient::complete`] call.
@@ -136,5 +147,36 @@ pub trait ModelClient {
             on_update(text);
         }
         Ok(response)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn turn_count_is_zero_for_an_empty_context() {
+        assert_eq!(Context::default().turn_count(), 0);
+    }
+
+    #[test]
+    fn turn_count_counts_only_user_messages() {
+        let context = Context {
+            messages: vec![
+                ContextMessage::System("system prompt".to_string()),
+                ContextMessage::User("first".to_string()),
+                ContextMessage::Assistant {
+                    text: Some("reply".to_string()),
+                    tool_calls: Vec::new(),
+                },
+                ContextMessage::ToolResult {
+                    tool_call_id: "call_1".to_string(),
+                    content: "output".to_string(),
+                },
+                ContextMessage::User("second".to_string()),
+            ],
+        };
+
+        assert_eq!(context.turn_count(), 2);
     }
 }

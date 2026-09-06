@@ -65,6 +65,21 @@ pub fn free_dots(context_length: Option<u32>, used_tokens: u32) -> u32 {
         .unwrap_or(0)
 }
 
+/// The percentage of `context_length`'s budget that `used_tokens` has consumed.
+///
+/// For the Context Visualization's percentage display. Returns `None` if
+/// `context_length` is unknown (or reports zero), and clamps to `100` if
+/// `used_tokens` has exceeded it — mirroring `free_dots`'s clamp-to-zero for
+/// the same case.
+#[must_use]
+pub fn context_percent_used(context_length: Option<u32>, used_tokens: u32) -> Option<u32> {
+    let context_length = context_length?;
+    let percent = used_tokens
+        .saturating_mul(100)
+        .checked_div(context_length)?;
+    Some(percent.min(100))
+}
+
 /// Estimates a per-message token count for each message in `context`, scaled
 /// so the estimates sum to exactly `total_tokens`. Returns an empty `Vec` for
 /// an empty context.
@@ -182,6 +197,26 @@ mod tests {
     #[test]
     fn free_dots_is_zero_rather_than_negative_when_used_exceeds_context_length() {
         assert_eq!(free_dots(Some(1_000), 5_000), 0);
+    }
+
+    #[test]
+    fn context_percent_used_is_none_when_context_length_is_unknown() {
+        assert_eq!(context_percent_used(None, 500), None);
+    }
+
+    #[test]
+    fn context_percent_used_computes_the_percentage() {
+        assert_eq!(context_percent_used(Some(1_000), 250), Some(25));
+    }
+
+    #[test]
+    fn context_percent_used_clamps_to_100_when_used_exceeds_context_length() {
+        assert_eq!(context_percent_used(Some(1_000), 2_000), Some(100));
+    }
+
+    #[test]
+    fn context_percent_used_is_none_rather_than_dividing_by_zero() {
+        assert_eq!(context_percent_used(Some(0), 100), None);
     }
 
     #[test]
