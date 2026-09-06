@@ -35,17 +35,31 @@ pub enum SessionState {
 
 /// One update from a Turn in progress.
 ///
-/// Reported via [`Session::send_user_message`]'s `on_event` callback — the
-/// Controller uses this to reflect the live [`SessionState`] and streamed
-/// text without waiting for the whole Turn to finish and refreshing from a
-/// `Session` snapshot.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Reported via [`Session::send_user_message`]'s `on_event` callback for
+/// every change a caller would otherwise only see once the whole Turn
+/// finishes and it refreshes from a `Session` snapshot: streamed text,
+/// [`SessionState`] transitions, each message as it's appended (an
+/// Assistant message's tool calls and each one's result included), and the
+/// step/tool-call counters.
+#[derive(Debug, Clone, PartialEq)]
 pub enum TurnEvent {
     /// The current step's assistant text, accumulated so far (see
     /// [`ModelClient::complete_streaming`]).
     Text(String),
     /// [`Session::state`] just changed to this value.
     StateChanged(SessionState),
+    /// A message was just appended to [`Session::context`] — an Assistant
+    /// message (with any tool calls it requested) or the result of running
+    /// one.
+    MessageAppended(ContextMessage),
+    /// [`Session::step_count`] and/or [`Session::tool_call_count`] and/or
+    /// [`Session::last_usage`] just changed to these values (sent whenever
+    /// any of them does, so all three are always current together).
+    CountersChanged {
+        step_count: u32,
+        tool_call_count: u32,
+        last_usage: Option<Usage>,
+    },
 }
 
 /// Formats one Bash tool call's result. `stdout`/`stderr` sections are
@@ -103,10 +117,10 @@ impl Session {
     /// call — is reached. Returns to [`SessionState::AwaitingUserInput`]
     /// either way, even on error.
     ///
-    /// `on_event` is called with the current step's assistant text as it
-    /// streams in, and every time [`Session::state`] changes (see
-    /// [`TurnEvent`]) — so a caller can reflect the Turn's live progress
-    /// without waiting for it to finish.
+    /// `on_event` reports the Turn's live progress (see [`TurnEvent`]) —
+    /// streamed text, state transitions, each appended message, and the
+    /// counters — so a caller can reflect all of it as it happens, without
+    /// waiting for the whole Turn to finish.
     ///
     /// # Errors
     ///
@@ -152,6 +166,15 @@ impl Session {
         result
     }
 
+    /// A [`TurnEvent::CountersChanged`] snapshotting the current counters.
+    const fn counters_event(&self) -> TurnEvent {
+        TurnEvent::CountersChanged {
+            step_count: self.step_count,
+            tool_call_count: self.tool_call_count,
+            last_usage: self.last_usage,
+        }
+    }
+
     async fn run_steps<C: ModelClient + Sync>(
         &mut self,
         client: &C,
@@ -162,6 +185,7 @@ impl Session {
 
         while self.step_count < config.max_steps {
             self.step_count = self.step_count.saturating_add(1);
+            on_event(self.counters_event());
             self.state = SessionState::CallingModel {
                 step: self.step_count,
             };
@@ -173,10 +197,13 @@ impl Session {
                 })
                 .await?;
             self.last_usage = Some(response.usage);
-            self.context.push(ContextMessage::Assistant {
+            on_event(self.counters_event());
+            let assistant_message = ContextMessage::Assistant {
                 text: response.text,
                 tool_calls: response.tool_calls.clone(),
-            });
+            };
+            self.context.push(assistant_message.clone());
+            on_event(TurnEvent::MessageAppended(assistant_message));
 
             if response.tool_calls.is_empty() {
                 break;
@@ -219,11 +246,14 @@ impl Session {
                     tool_call_id: tool_call.id.clone(),
                     content,
                 };
-                self.context.push(ContextMessage::ToolResult {
+                let tool_result_message = ContextMessage::ToolResult {
                     tool_call_id: result.tool_call_id.clone(),
                     content: result.content.clone(),
-                });
+                };
+                self.context.push(tool_result_message.clone());
+                on_event(TurnEvent::MessageAppended(tool_result_message));
                 self.tool_call_count = self.tool_call_count.saturating_add(1);
+                on_event(self.counters_event());
 
                 if let SessionState::ExecutingTools { results, .. } = &mut self.state {
                     results.push(result);
@@ -601,6 +631,80 @@ mod tests {
                     results: Vec::new(),
                 },
                 SessionState::CallingModel { step: 2 },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn on_event_reports_every_message_as_it_s_appended() {
+        let client = FakeModelClient::new(vec![
+            tool_call_response(&[("call_1", "echo one")]),
+            text_response("done"),
+        ]);
+        let config = test_config(10);
+        let mut session = Session::new("system prompt");
+        let messages = Mutex::new(Vec::new());
+
+        session
+            .send_user_message("run something".to_string(), &client, &config, |event| {
+                if let TurnEvent::MessageAppended(message) = event {
+                    messages.lock().unwrap().push(message);
+                }
+            })
+            .await
+            .unwrap();
+
+        // Matches exactly the non-User messages that ended up in context,
+        // in the order they were appended — a live caller sees each one as
+        // it happens, not only once the whole Turn finishes.
+        let expected: Vec<_> = session
+            .context
+            .messages
+            .iter()
+            .filter(|message| {
+                !matches!(message, ContextMessage::System(_) | ContextMessage::User(_))
+            })
+            .cloned()
+            .collect();
+        assert_eq!(messages.into_inner().unwrap(), expected);
+        assert_eq!(expected.len(), 3); // tool-call assistant msg, tool result, final assistant msg
+    }
+
+    #[tokio::test]
+    async fn on_event_reports_counters_live_as_they_change() {
+        let client = FakeModelClient::new(vec![
+            tool_call_response(&[("call_1", "echo one")]),
+            text_response("done"),
+        ]);
+        let config = test_config(10);
+        let mut session = Session::new("system prompt");
+        let snapshots = Mutex::new(Vec::new());
+
+        session
+            .send_user_message("run something".to_string(), &client, &config, |event| {
+                if let TurnEvent::CountersChanged {
+                    step_count,
+                    tool_call_count,
+                    ..
+                } = event
+                {
+                    snapshots
+                        .lock()
+                        .unwrap()
+                        .push((step_count, tool_call_count));
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            snapshots.into_inner().unwrap(),
+            vec![
+                (1, 0), // step 1 starts
+                (1, 0), // step 1's response arrived (usage updated)
+                (1, 1), // the tool call it requested just ran
+                (2, 1), // step 2 starts
+                (2, 1), // step 2's response arrived
             ]
         );
     }

@@ -30,17 +30,14 @@ const FREE_DOT_COLOR: Color = Color::DarkGray;
 
 /// Ephemeral state the Controller owns that isn't part of `Session`: the
 /// input box contents, whether a turn is in flight, the last turn's error
-/// (if any), text streamed so far for the in-progress turn (not yet folded
-/// into `Session`), the in-progress turn's live `SessionState` (`display`'s
-/// own state is stale while a turn runs — see `Session::send_user_message`'s
-/// `TurnEvent`), and how far the transcript is manually scrolled up from the
-/// bottom (`None` means pinned to the bottom).
+/// (if any), text streamed so far for the in-progress turn's current step
+/// (not yet folded into `Session`), and how far the transcript is manually
+/// scrolled up from the bottom (`None` means pinned to the bottom).
 pub struct ControllerState<'a> {
     pub input: &'a str,
     pub processing: bool,
     pub error_banner: Option<&'a str>,
     pub streaming_text: Option<&'a str>,
-    pub live_state: Option<&'a SessionState>,
     pub scroll_offset: Option<u16>,
 }
 
@@ -269,90 +266,44 @@ const fn state_label(state: &SessionState) -> &'static str {
 }
 
 /// Whether `target` and `current` are the same [`SessionState`] variant,
-/// ignoring their payloads (e.g. `step`) — for highlighting the current
-/// phase in the state-machine diagram, where the diagram's own boxes carry
-/// placeholder payloads.
+/// ignoring their payloads (e.g. `step`) — for underlining the current
+/// phase in `state_oneliner`, whose own placeholder states carry no
+/// meaningful payload.
 fn is_current_phase(target: &SessionState, current: &SessionState) -> bool {
     std::mem::discriminant(target) == std::mem::discriminant(current)
 }
 
-/// The width of each box's interior in the state-machine diagram, wide
-/// enough to center "Executing Tools" (its longest label).
-const DIAGRAM_BOX_WIDTH: usize = 19;
-
-/// One horizontal border of a diagram box.
-fn diagram_border(left: char, right: char) -> Line<'static> {
-    Line::from(format!("{left}{}{right}", "─".repeat(DIAGRAM_BOX_WIDTH)))
-}
-
-/// One diagram box's label line, underlined and bold when `target` is the
-/// current phase (see `is_current_phase`).
-fn diagram_label(label: &str, target: &SessionState, current: &SessionState) -> Line<'static> {
-    let style = if is_current_phase(target, current) {
-        Style::default().add_modifier(Modifier::UNDERLINED | Modifier::BOLD)
-    } else {
-        Style::default()
+/// The state machine as one line — `CONTEXT.md`'s three Loop phases in
+/// order, with `current`'s label underlined.
+fn state_oneliner(current: &SessionState) -> Line<'static> {
+    let label = |text: &'static str, target: &SessionState| {
+        let style = if is_current_phase(target, current) {
+            Style::default().add_modifier(Modifier::UNDERLINED)
+        } else {
+            Style::default()
+        };
+        Span::styled(text, style)
     };
+
     Line::from(vec![
-        Span::raw("│"),
-        Span::styled(format!("{label:^DIAGRAM_BOX_WIDTH$}"), style),
-        Span::raw("│"),
+        label("Awaiting Input", &SessionState::AwaitingUserInput),
+        Span::raw(" → "),
+        label("Calling Model", &SessionState::CallingModel { step: 0 }),
+        Span::raw(" ↔ "),
+        label(
+            "Executing Tools",
+            &SessionState::ExecutingTools {
+                step: 0,
+                pending: Vec::new(),
+                results: Vec::new(),
+            },
+        ),
     ])
-}
-
-/// A transition arrow from one diagram box to the next, labeled with what
-/// triggers it.
-fn diagram_transition(label: &str) -> [Line<'static>; 2] {
-    [
-        Line::from(format!("{:9}│ {label}", "")),
-        Line::from(format!("{:9}▼", "")),
-    ]
-}
-
-/// The state-machine diagram: `CONTEXT.md`'s three Loop phases as boxes
-/// connected by their transitions, with `current`'s box underlined. The two
-/// transitions back up the diagram (Executing Tools looping to Calling
-/// Model for the next step, and Calling Model returning straight to
-/// Awaiting Input once a Turn has no more tool calls) are noted as text
-/// rather than drawn as arrows, to keep the diagram legible in a narrow
-/// sidebar.
-fn state_diagram_lines(current: &SessionState) -> Vec<Line<'static>> {
-    let mut lines = vec![diagram_border('┌', '┐')];
-    lines.push(diagram_label(
-        "Awaiting Input",
-        &SessionState::AwaitingUserInput,
-        current,
-    ));
-    lines.push(diagram_border('└', '┘'));
-    lines.extend(diagram_transition("send message"));
-    lines.push(diagram_border('┌', '┐'));
-    lines.push(diagram_label(
-        "Calling Model",
-        &SessionState::CallingModel { step: 0 },
-        current,
-    ));
-    lines.push(diagram_border('└', '┘'));
-    lines.extend(diagram_transition("tool calls"));
-    lines.push(diagram_border('┌', '┐'));
-    lines.push(diagram_label(
-        "Executing Tools",
-        &SessionState::ExecutingTools {
-            step: 0,
-            pending: Vec::new(),
-            results: Vec::new(),
-        },
-        current,
-    ));
-    lines.push(diagram_border('└', '┘'));
-    lines.push(Line::from("  ↺ next step calls the model again"));
-    lines.push(Line::from("  (no tool calls → back to Awaiting Input)"));
-    lines
 }
 
 fn info_lines(
     session: &Session,
     config: &Config,
-    live_state: Option<&SessionState>,
     context_length: Option<u32>,
 ) -> Vec<Line<'static>> {
     let cost = session
@@ -361,10 +312,6 @@ fn info_lines(
     let total_tokens = session.last_usage.map_or(0, |usage| usage.total_tokens);
     let percent_used = context_percent_used(context_length, total_tokens)
         .map_or_else(|| "?%".to_string(), |percent| format!("{percent}%"));
-    // `live_state`, when present, is the in-progress turn's real state
-    // (`session` itself is a point-in-time snapshot that can't reflect a
-    // turn in progress — see `ControllerState::live_state`'s doc comment).
-    let state = live_state.unwrap_or(&session.state);
 
     let mut lines = vec![
         Line::from(format!("model: {}", config.model)),
@@ -372,7 +319,7 @@ fn info_lines(
         Line::from(format!("step: {}/{}", session.step_count, config.max_steps)),
         Line::from(format!("tool calls: {}", session.tool_call_count)),
         Line::from(format!("last call cost: {cost}")),
-        Line::from(format!("state: {}", state_label(state))),
+        state_oneliner(&session.state),
         Line::from(""),
         Line::from(format!(
             "context (~{total_tokens} tokens, {percent_used} used):"
@@ -384,8 +331,6 @@ fn info_lines(
     )));
     lines.push(Line::default());
     lines.extend(legend_lines());
-    lines.push(Line::default());
-    lines.extend(state_diagram_lines(state));
     lines
 }
 
@@ -450,10 +395,10 @@ pub fn render(
         .end_symbol(None);
     frame.render_stateful_widget(scrollbar, transcript_area, &mut scrollbar_state);
 
-    let input_title = controller.live_state.map_or_else(
-        || "Message".to_string(),
-        |state| format!("Message ({})", state_label(state)),
-    );
+    let input_title = match session.state {
+        SessionState::AwaitingUserInput => "Message".to_string(),
+        ref state => format!("Message ({})", state_label(state)),
+    };
     let input_style = if controller.error_banner.is_some() {
         Style::default().fg(Color::Red)
     } else {
@@ -483,14 +428,9 @@ pub fn render(
         .block(Block::default().borders(Borders::ALL).title(input_title));
     frame.render_widget(input_paragraph, input_area);
 
-    let info = Paragraph::new(info_lines(
-        session,
-        config,
-        controller.live_state,
-        context_length,
-    ))
-    .block(Block::default().borders(Borders::ALL).title("Info"))
-    .wrap(Wrap { trim: false });
+    let info = Paragraph::new(info_lines(session, config, context_length))
+        .block(Block::default().borders(Borders::ALL).title("Info"))
+        .wrap(Wrap { trim: false });
     frame.render_widget(info, info_area);
 
     if !controller.processing && controller.error_banner.is_none() {

@@ -1,8 +1,10 @@
 //! The Controller: an async event loop that forwards terminal input/tick
 //! events through a channel and, depending on `SessionState`, drives the
-//! `Session`/`ModelClient` loop, feeding results back through the same
-//! channel. `Session` itself has no knowledge of the terminal or the
-//! channel.
+//! `Session`/`ModelClient` loop. `Session` itself has no knowledge of the
+//! terminal or the channel; the loop's own `display: Session` is a live
+//! mirror kept in sync by applying each `TurnEvent` (forwarded as an
+//! `AppEvent`) as it arrives — not a snapshot refreshed only once a turn
+//! finishes.
 
 use std::sync::Arc;
 use std::thread;
@@ -15,7 +17,7 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::task::{JoinError, JoinHandle, LocalSet};
 
 use tib::config::Config;
-use tib::model_client::ModelClient;
+use tib::model_client::{ContextMessage, ModelClient, Usage};
 use tib::session::{Session, SessionState, TurnEvent};
 
 use crate::view::{self, ControllerState};
@@ -26,20 +28,25 @@ const TICK_RATE: Duration = Duration::from_millis(200);
 /// for `Up`/`Down`.
 const SCROLL_PAGE: u16 = 10;
 
+/// Mirrors `TurnEvent` one-for-one (plus the terminal/lifecycle events),
+/// forwarded from the spawned turn task so `AppState` can apply each one to
+/// `display` as it arrives — see the module doc comment.
 enum AppEvent {
     Key(KeyEvent),
     Resize,
     Tick,
     /// The in-progress turn's current step's assistant text, accumulated so
-    /// far, forwarded from `ModelClient::complete_streaming`'s `on_update`
-    /// callback. Replaces (rather than appends to) `streaming_text`, so a
-    /// new step's first update naturally overwrites the previous step's
+    /// far. Replaces (rather than appends to) `streaming_text`, so a new
+    /// step's first update naturally overwrites the previous step's
     /// leftover text instead of concatenating onto it.
     StreamChunk(String),
-    /// `Session::state` just changed, forwarded from `TurnEvent::StateChanged`
-    /// so the Controller can reflect it live instead of only at turn
-    /// boundaries.
     StateChanged(SessionState),
+    MessageAppended(ContextMessage),
+    CountersChanged {
+        step_count: u32,
+        tool_call_count: u32,
+        last_usage: Option<Usage>,
+    },
     TurnFinished(Result<()>),
 }
 
@@ -113,6 +120,16 @@ where
                     let app_event = match event {
                         TurnEvent::Text(text) => AppEvent::StreamChunk(text),
                         TurnEvent::StateChanged(state) => AppEvent::StateChanged(state),
+                        TurnEvent::MessageAppended(message) => AppEvent::MessageAppended(message),
+                        TurnEvent::CountersChanged {
+                            step_count,
+                            tool_call_count,
+                            last_usage,
+                        } => AppEvent::CountersChanged {
+                            step_count,
+                            tool_call_count,
+                            last_usage,
+                        },
                     };
                     let _unused = event_tx.send(app_event);
                 })
@@ -165,24 +182,20 @@ struct AppState<C> {
     input: String,
     processing: bool,
     error_banner: Option<String>,
-    /// Text streamed so far for the in-progress turn, via
-    /// `AppEvent::StreamChunk`; cleared once the turn folds its finalized
-    /// message into `display`.
+    /// Text streamed so far for the in-progress turn's current step, via
+    /// `AppEvent::StreamChunk`; cleared once that step's message is folded
+    /// into `display` via `AppEvent::MessageAppended` (or the turn ends).
     streaming_text: String,
-    /// The in-progress turn's live `SessionState`, via
-    /// `AppEvent::StateChanged`; cleared once the turn finishes, since
-    /// `display.state` (always `AwaitingUserInput` right after a turn) takes
-    /// over at that point.
-    live_state: Option<SessionState>,
     /// How many lines the user has manually scrolled the transcript up from
     /// the bottom; `None` means pinned to the bottom (see
     /// `view::resolve_scroll`'s doc comment).
     scroll_offset: Option<u16>,
-    // A point-in-time copy of `Session` for rendering: refreshed only at
-    // turn boundaries (start-up and `TurnFinished`), since the spawned turn
-    // task holds `session`'s lock for the whole turn anyway (see `run`'s
-    // doc comment) — polling it on every tick would just re-clone the same
-    // unchanged snapshot.
+    /// The Controller's live mirror of `session` for rendering: seeded by
+    /// cloning `session` once at startup and after pushing a new user
+    /// message, then kept in sync for the rest of the turn purely by
+    /// applying each `AppEvent` translated from a `TurnEvent` — never by
+    /// re-locking and re-cloning `session`, which the spawned turn task
+    /// holds for the turn's whole duration (see `run`'s doc comment).
     display: Session,
     // The in-flight turn's task, tracked so a panic inside it (which would
     // otherwise leave `processing` stuck `true` forever, since the
@@ -209,7 +222,6 @@ where
             processing: false,
             error_banner: None,
             streaming_text: String::new(),
-            live_state: None,
             scroll_offset: None,
             display,
             turn_handle: None,
@@ -223,7 +235,6 @@ where
             error_banner: self.error_banner.as_deref(),
             streaming_text: (!self.streaming_text.is_empty())
                 .then_some(self.streaming_text.as_str()),
-            live_state: self.live_state.as_ref(),
             scroll_offset: self.scroll_offset,
         };
         let max_scroll = view::render(
@@ -278,7 +289,6 @@ where
                             session.push_user_message(message);
                             self.display = session.clone();
                         }
-                        self.live_state = Some(SessionState::CallingModel { step: 1 });
                         self.turn_handle = Some(spawn_turn(
                             Arc::clone(&self.session),
                             Arc::clone(&self.client),
@@ -300,23 +310,21 @@ where
     fn on_turn_finished(&mut self, result: Result<()>) {
         self.processing = false;
         self.streaming_text.clear();
-        self.live_state = None;
+        // Every other change this turn made was already applied live as its
+        // `AppEvent` arrived; `run_turn` sets this last transition without
+        // going through `on_event`, since by then the turn (and so the
+        // event stream) is already over.
+        self.display.state = SessionState::AwaitingUserInput;
         if let Err(error) = result {
             self.error_banner = Some(error.to_string());
-        }
-        if let Ok(guard) = self.session.try_lock() {
-            self.display = guard.clone();
         }
     }
 
     fn on_turn_panicked(&mut self, join_error: &JoinError) {
         self.processing = false;
         self.streaming_text.clear();
-        self.live_state = None;
+        self.display.state = SessionState::AwaitingUserInput;
         self.error_banner = Some(format!("turn task panicked: {join_error}"));
-        if let Ok(guard) = self.session.try_lock() {
-            self.display = guard.clone();
-        }
     }
 }
 
@@ -362,7 +370,23 @@ where
                         }
                     }
                     AppEvent::StreamChunk(text_so_far) => state.streaming_text = text_so_far,
-                    AppEvent::StateChanged(session_state) => state.live_state = Some(session_state),
+                    AppEvent::StateChanged(session_state) => state.display.state = session_state,
+                    AppEvent::MessageAppended(message) => {
+                        state.display.context.push(message);
+                        // The step's streamed preview is now this finalized
+                        // message in `display.context` instead; showing
+                        // both would duplicate it in the transcript.
+                        state.streaming_text.clear();
+                    }
+                    AppEvent::CountersChanged {
+                        step_count,
+                        tool_call_count,
+                        last_usage,
+                    } => {
+                        state.display.step_count = step_count;
+                        state.display.tool_call_count = tool_call_count;
+                        state.display.last_usage = last_usage;
+                    }
                     AppEvent::TurnFinished(result) => state.on_turn_finished(result),
                 }
             }
