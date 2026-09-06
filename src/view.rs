@@ -55,38 +55,109 @@ const fn role_color(role: Role) -> Color {
     }
 }
 
+/// Splits `text` at its `count`-th character (by count, not byte index, so
+/// this is safe on multi-byte UTF-8), returning `(text, "")` if it has
+/// `count` characters or fewer.
+fn split_at_char_count(text: &str, count: usize) -> (&str, &str) {
+    text.char_indices()
+        .nth(count)
+        .map_or((text, ""), |(byte_index, _)| text.split_at(byte_index))
+}
+
+/// Greedily wraps `text` to `width` characters, breaking on spaces where
+/// possible; a single word longer than `width` is hard-broken instead of
+/// left to overflow. Measures by character count (like the input box
+/// already does), not true terminal display width. Ratatui's own word
+/// wrapper isn't public, so the transcript pane pre-wraps with this instead,
+/// which lets it repeat the gutter marker on every wrapped row of a message
+/// — see `message_lines`.
+fn wrap_line(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
+    }
+
+    let mut lines = Vec::new();
+    let mut current = String::new();
+
+    for mut word in text.split(' ') {
+        loop {
+            let candidate_len = if current.is_empty() {
+                word.chars().count()
+            } else {
+                current
+                    .chars()
+                    .count()
+                    .saturating_add(1)
+                    .saturating_add(word.chars().count())
+            };
+
+            if candidate_len <= width {
+                if !current.is_empty() {
+                    current.push(' ');
+                }
+                current.push_str(word);
+                break;
+            }
+
+            if current.is_empty() {
+                let (head, rest) = split_at_char_count(word, width);
+                lines.push(head.to_string());
+                word = rest;
+                if word.is_empty() {
+                    break;
+                }
+            } else {
+                lines.push(std::mem::take(&mut current));
+            }
+        }
+    }
+
+    if !current.is_empty() || lines.is_empty() {
+        lines.push(current);
+    }
+
+    lines
+}
+
 /// One message's lines, each prefixed with a role-colored gutter marker; the
-/// message text itself stays in the terminal's default color.
-fn message_lines(role: Role, text: &str) -> Vec<Line<'static>> {
+/// message text itself stays in the terminal's default color. `text` is
+/// wrapped to `width` characters first (see `wrap_line`), so the gutter is
+/// repeated on every wrapped row rather than only the message's first line.
+fn message_lines(role: Role, text: &str, width: usize) -> Vec<Line<'static>> {
     let gutter_style = Style::default().fg(role_color(role));
     text.lines()
-        .map(|line| {
-            Line::from(vec![
-                Span::styled(GUTTER, gutter_style),
-                Span::raw(line.to_string()),
-            ])
-        })
+        .flat_map(|line| wrap_line(line, width))
+        .map(|wrapped| Line::from(vec![Span::styled(GUTTER, gutter_style), Span::raw(wrapped)]))
         .collect()
 }
 
 /// The transcript's lines: one blank separator line between each message
 /// (including a trailing in-progress `streaming_text`, if any) so sections
-/// are visually distinct.
-fn transcript_lines(session: &Session, streaming_text: Option<&str>) -> Vec<Line<'static>> {
+/// are visually distinct. `width` is the available character width for
+/// message text, i.e. excluding the gutter marker (see `message_lines`).
+fn transcript_lines(
+    session: &Session,
+    streaming_text: Option<&str>,
+    width: usize,
+) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     for message in &session.context.messages {
         if !lines.is_empty() {
             lines.push(Line::default());
         }
-        lines.extend(message_lines(message.role(), &message.display_text()));
+        lines.extend(message_lines(
+            message.role(),
+            &message.display_text(),
+            width,
+        ));
     }
 
     if let Some(text) = streaming_text.filter(|text| !text.is_empty()) {
         if !lines.is_empty() {
             lines.push(Line::default());
         }
-        lines.extend(message_lines(Role::Assistant, text));
+        lines.extend(message_lines(Role::Assistant, text, width));
     }
 
     lines
@@ -316,13 +387,17 @@ pub fn render(
 ) -> u16 {
     let (transcript_area, input_area, info_area) = layout(frame.area());
 
-    let lines = transcript_lines(session, controller.streaming_text);
+    // 2 for the block's left/right borders, 1 for the gutter marker
+    // (see `message_lines`) that precedes every wrapped row's text.
+    let text_width = usize::from(transcript_area.width.saturating_sub(3));
+    let lines = transcript_lines(session, controller.streaming_text, text_width);
     let line_count = u16::try_from(lines.len()).unwrap_or(u16::MAX);
     let transcript_height = transcript_area.height.saturating_sub(2);
-    // Approximates scroll-to-bottom using unwrapped line count (a message
-    // that wraps to multiple rows is undercounted here), which is close
-    // enough to keep the latest messages in view without depending on
-    // ratatui's unstable line-counting API.
+    // Wrapping ourselves (see `wrap_line`) means `lines` already counts one
+    // entry per wrapped row, so this scroll-to-bottom math no longer needs
+    // to approximate — it can still be off by a row for wide (non-ASCII)
+    // text, since `wrap_line` measures by character count rather than
+    // ratatui's own (unstable, private) display-width-aware wrapper.
     let max_scroll = line_count.saturating_sub(transcript_height);
     let scroll = resolve_scroll(controller.scroll_offset, max_scroll);
     let transcript = Paragraph::new(lines)
@@ -399,6 +474,35 @@ pub fn render(
 mod tests {
     use super::*;
     use tib::model_client::ToolCallRequest;
+
+    #[test]
+    fn wrap_line_returns_short_text_unchanged() {
+        assert_eq!(
+            wrap_line("hello world", 20),
+            vec!["hello world".to_string()]
+        );
+    }
+
+    #[test]
+    fn wrap_line_breaks_at_word_boundaries() {
+        assert_eq!(
+            wrap_line("ab cd efgh", 7),
+            vec!["ab cd".to_string(), "efgh".to_string()]
+        );
+    }
+
+    #[test]
+    fn wrap_line_preserves_a_blank_line() {
+        assert_eq!(wrap_line("", 10), vec![String::new()]);
+    }
+
+    #[test]
+    fn wrap_line_hard_breaks_a_single_word_longer_than_width() {
+        assert_eq!(
+            wrap_line("abcdefghij", 4),
+            vec!["abcd".to_string(), "efgh".to_string(), "ij".to_string()]
+        );
+    }
 
     #[test]
     fn is_current_phase_matches_by_variant_ignoring_payload() {
