@@ -119,15 +119,51 @@ fn wrap_line(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// How many wrapped rows of a Tool message's output are shown before the
+/// rest is hidden (display only — the model still gets the whole thing;
+/// see `TOOL_OUTPUT_DISPLAY_LIMIT`'s use in `message_lines`).
+const TOOL_OUTPUT_DISPLAY_LIMIT: usize = 40;
+
+/// Keeps only the last `TOOL_OUTPUT_DISPLAY_LIMIT` of `lines`, with a notice
+/// in place of the rest, so a long tool output (a big `cat`, a build log)
+/// doesn't push everything else out of the visible transcript. Returns
+/// `lines` unchanged if it's already within the limit.
+fn truncate_for_display(lines: Vec<String>) -> Vec<String> {
+    let Some(hidden) = lines.len().checked_sub(TOOL_OUTPUT_DISPLAY_LIMIT) else {
+        return lines;
+    };
+    if hidden == 0 {
+        return lines;
+    }
+    let mut truncated = vec![format!("… {hidden} more lines hidden (display only) …")];
+    truncated.extend(lines.into_iter().skip(hidden));
+    truncated
+}
+
 /// One message's lines, each prefixed with a role-colored gutter marker; the
 /// message text itself stays in the terminal's default color. `text` is
-/// wrapped to `width` characters first (see `wrap_line`), so the gutter is
-/// repeated on every wrapped row rather than only the message's first line.
+/// wrapped to `width` characters first (see `wrap_line`); for a Tool
+/// message, the wrapped rows are then capped at `TOOL_OUTPUT_DISPLAY_LIMIT`
+/// (see `truncate_for_display`) — display only, never sent to the model.
 fn message_lines(role: Role, text: &str, width: usize) -> Vec<Line<'static>> {
     let gutter_style = Style::default().fg(role_color(role));
-    text.lines()
+    let wrapped: Vec<String> = text
+        .lines()
         .flat_map(|line| wrap_line(line, width))
-        .map(|wrapped| Line::from(vec![Span::styled(GUTTER, gutter_style), Span::raw(wrapped)]))
+        .collect();
+    let wrapped = if matches!(role, Role::Tool) {
+        truncate_for_display(wrapped)
+    } else {
+        wrapped
+    };
+    wrapped
+        .into_iter()
+        .map(|wrapped_line| {
+            Line::from(vec![
+                Span::styled(GUTTER, gutter_style),
+                Span::raw(wrapped_line),
+            ])
+        })
         .collect()
 }
 
@@ -474,6 +510,25 @@ pub fn render(
 mod tests {
     use super::*;
     use tib::model_client::ToolCallRequest;
+
+    #[test]
+    fn truncate_for_display_leaves_short_output_unchanged() {
+        let lines: Vec<String> = (0..40).map(|n| format!("line {n}")).collect();
+
+        assert_eq!(truncate_for_display(lines.clone()), lines);
+    }
+
+    #[test]
+    fn truncate_for_display_keeps_the_last_lines_with_a_notice() {
+        let lines: Vec<String> = (0..45).map(|n| format!("line {n}")).collect();
+
+        let truncated = truncate_for_display(lines);
+
+        assert_eq!(truncated.len(), 41);
+        assert_eq!(truncated[0], "… 5 more lines hidden (display only) …");
+        assert_eq!(truncated[1], "line 5");
+        assert_eq!(truncated.last(), Some(&"line 44".to_string()));
+    }
 
     #[test]
     fn wrap_line_returns_short_text_unchanged() {
