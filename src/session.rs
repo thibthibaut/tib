@@ -33,6 +33,21 @@ pub enum SessionState {
     },
 }
 
+/// One update from a Turn in progress.
+///
+/// Reported via [`Session::send_user_message`]'s `on_event` callback — the
+/// Controller uses this to reflect the live [`SessionState`] and streamed
+/// text without waiting for the whole Turn to finish and refreshing from a
+/// `Session` snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnEvent {
+    /// The current step's assistant text, accumulated so far (see
+    /// [`ModelClient::complete_streaming`]).
+    Text(String),
+    /// [`Session::state`] just changed to this value.
+    StateChanged(SessionState),
+}
+
 /// Formats one Bash tool call's result. `stdout`/`stderr` sections are
 /// omitted entirely when empty, rather than shown as empty-bodied headers,
 /// so a command that only writes to one stream doesn't pad the transcript
@@ -88,8 +103,10 @@ impl Session {
     /// call — is reached. Returns to [`SessionState::AwaitingUserInput`]
     /// either way, even on error.
     ///
-    /// `on_update` is called with each step's assistant text accumulated so
-    /// far as it streams in (see [`ModelClient::complete_streaming`]).
+    /// `on_event` is called with the current step's assistant text as it
+    /// streams in, and every time [`Session::state`] changes (see
+    /// [`TurnEvent`]) — so a caller can reflect the Turn's live progress
+    /// without waiting for it to finish.
     ///
     /// # Errors
     ///
@@ -101,11 +118,36 @@ impl Session {
         user_message: String,
         client: &C,
         config: &Config,
-        on_update: impl FnMut(&str) + Send,
+        on_event: impl FnMut(TurnEvent) + Send,
     ) -> Result<()> {
-        self.context.push(ContextMessage::User(user_message));
+        self.push_user_message(user_message);
+        self.run_turn(client, config, on_event).await
+    }
 
-        let result = self.run_steps(client, config, on_update).await;
+    /// Pushes `user_message` onto the context, starting a new Turn. Split
+    /// out from `send_user_message` so a caller (the Controller) can show
+    /// the message immediately, before the model call that follows it —
+    /// which may take a while — has even started; pair it with
+    /// [`Session::run_turn`] to actually drive the loop.
+    pub fn push_user_message(&mut self, user_message: String) {
+        self.context.push(ContextMessage::User(user_message));
+    }
+
+    /// Drives the current Turn forward — calling `client` and executing any
+    /// requested Bash tool calls for real, the same as `send_user_message` —
+    /// without pushing a user message first, for a caller that already
+    /// pushed one separately via [`Session::push_user_message`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error under the same conditions as `send_user_message`.
+    pub async fn run_turn<C: ModelClient + Sync>(
+        &mut self,
+        client: &C,
+        config: &Config,
+        on_event: impl FnMut(TurnEvent) + Send,
+    ) -> Result<()> {
+        let result = self.run_steps(client, config, on_event).await;
         self.state = SessionState::AwaitingUserInput;
         result
     }
@@ -114,7 +156,7 @@ impl Session {
         &mut self,
         client: &C,
         config: &Config,
-        mut on_update: impl FnMut(&str) + Send,
+        mut on_event: impl FnMut(TurnEvent) + Send,
     ) -> Result<()> {
         self.step_count = 0;
 
@@ -123,9 +165,12 @@ impl Session {
             self.state = SessionState::CallingModel {
                 step: self.step_count,
             };
+            on_event(TurnEvent::StateChanged(self.state.clone()));
 
             let response = client
-                .complete_streaming(&self.context, &mut on_update)
+                .complete_streaming(&self.context, |text: &str| {
+                    on_event(TurnEvent::Text(text.to_string()));
+                })
                 .await?;
             self.last_usage = Some(response.usage);
             self.context.push(ContextMessage::Assistant {
@@ -142,6 +187,7 @@ impl Session {
                 pending: response.tool_calls,
                 results: Vec::new(),
             };
+            on_event(TurnEvent::StateChanged(self.state.clone()));
 
             loop {
                 let tool_call = match &mut self.state {
@@ -194,6 +240,36 @@ mod tests {
     use super::*;
     use crate::model_client::{ModelResponse, Usage};
     use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn run_turn_drives_an_already_pushed_message_without_pushing_another() {
+        let client = FakeModelClient::new(vec![text_response("hi there")]);
+        let config = test_config(10);
+        let mut session = Session::new("system prompt");
+        session.push_user_message("hello".to_string());
+
+        session
+            .run_turn(&client, &config, |_event: TurnEvent| {})
+            .await
+            .unwrap();
+
+        assert_eq!(session.context.turn_count(), 1);
+        assert_eq!(session.state, SessionState::AwaitingUserInput);
+        assert_eq!(session.step_count, 1);
+    }
+
+    #[test]
+    fn push_user_message_appears_in_context_immediately_without_a_model_call() {
+        let mut session = Session::new("system prompt");
+
+        session.push_user_message("hello".to_string());
+
+        assert_eq!(session.context.turn_count(), 1);
+        assert_eq!(
+            session.context.messages.last(),
+            Some(&ContextMessage::User("hello".to_string()))
+        );
+    }
 
     fn bash_output(stdout: &str, stderr: &str) -> BashOutput {
         BashOutput {
@@ -317,7 +393,12 @@ mod tests {
         let mut session = Session::new("system prompt");
 
         session
-            .send_user_message("hello".to_string(), &client, &config, |_delta: &str| {})
+            .send_user_message(
+                "hello".to_string(),
+                &client,
+                &config,
+                |_event: TurnEvent| {},
+            )
             .await
             .unwrap();
 
@@ -340,7 +421,7 @@ mod tests {
                 "run something".to_string(),
                 &client,
                 &config,
-                |_delta: &str| {},
+                |_event: TurnEvent| {},
             )
             .await
             .unwrap();
@@ -375,7 +456,7 @@ mod tests {
                 "run two things".to_string(),
                 &client,
                 &config,
-                |_delta: &str| {},
+                |_event: TurnEvent| {},
             )
             .await
             .unwrap();
@@ -399,7 +480,7 @@ mod tests {
                 "keep going".to_string(),
                 &client,
                 &config,
-                |_delta: &str| {},
+                |_event: TurnEvent| {},
             )
             .await
             .unwrap();
@@ -416,7 +497,12 @@ mod tests {
         let mut session = Session::new("system prompt");
 
         let result = session
-            .send_user_message("hello".to_string(), &client, &config, |_delta: &str| {})
+            .send_user_message(
+                "hello".to_string(),
+                &client,
+                &config,
+                |_event: TurnEvent| {},
+            )
             .await;
 
         assert!(result.is_err());
@@ -433,13 +519,23 @@ mod tests {
         let mut session = Session::new("system prompt");
 
         session
-            .send_user_message("first".to_string(), &client, &config, |_delta: &str| {})
+            .send_user_message(
+                "first".to_string(),
+                &client,
+                &config,
+                |_event: TurnEvent| {},
+            )
             .await
             .unwrap();
         assert_eq!(session.step_count, 1);
 
         session
-            .send_user_message("second".to_string(), &client, &config, |_delta: &str| {})
+            .send_user_message(
+                "second".to_string(),
+                &client,
+                &config,
+                |_event: TurnEvent| {},
+            )
             .await
             .unwrap();
 
@@ -460,8 +556,10 @@ mod tests {
         let deltas = Mutex::new(Vec::new());
 
         session
-            .send_user_message("run something".to_string(), &client, &config, |delta| {
-                deltas.lock().unwrap().push(delta.to_string());
+            .send_user_message("run something".to_string(), &client, &config, |event| {
+                if let TurnEvent::Text(text) = event {
+                    deltas.lock().unwrap().push(text);
+                }
             })
             .await
             .unwrap();
@@ -469,5 +567,41 @@ mod tests {
         // Step 1's response is tool-calls-only (no text), so it contributes
         // no delta; step 2's "done" contributes exactly one.
         assert_eq!(deltas.into_inner().unwrap(), vec!["done".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn on_event_reports_every_state_change_as_the_turn_progresses() {
+        let client = FakeModelClient::new(vec![
+            tool_call_response(&[("call_1", "echo one")]),
+            text_response("done"),
+        ]);
+        let config = test_config(10);
+        let mut session = Session::new("system prompt");
+        let states = Mutex::new(Vec::new());
+
+        session
+            .send_user_message("run something".to_string(), &client, &config, |event| {
+                if let TurnEvent::StateChanged(state) = event {
+                    states.lock().unwrap().push(state);
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            states.into_inner().unwrap(),
+            vec![
+                SessionState::CallingModel { step: 1 },
+                SessionState::ExecutingTools {
+                    step: 1,
+                    pending: vec![ToolCallRequest {
+                        id: "call_1".to_string(),
+                        command: "echo one".to_string(),
+                    }],
+                    results: Vec::new(),
+                },
+                SessionState::CallingModel { step: 2 },
+            ]
+        );
     }
 }
