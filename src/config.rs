@@ -2,8 +2,8 @@ use eyre::WrapErr;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
-const REQUIRED_FIELDS: &str =
-    "model, max_steps, system_prompt, tool_timeout_seconds, tool_output_truncate_chars";
+const REQUIRED_FIELDS: &str = "model, max_steps, system_prompt, tool_timeout_seconds, \
+    tool_output_truncate_chars, local_model_timeout_seconds";
 
 const DEFAULT_SYSTEM_PROMPT: &str = "You are Tib, a terminal assistant with one tool: running \
     bash commands on this machine. Use it to check real state (files, command output, installed \
@@ -22,7 +22,8 @@ fn default_config_toml() -> String {
          max_steps = 20\n\
          system_prompt = \"{DEFAULT_SYSTEM_PROMPT}\"\n\
          tool_timeout_seconds = 30\n\
-         tool_output_truncate_chars = 10000\n"
+         tool_output_truncate_chars = 100000\n\
+         local_model_timeout_seconds = 30\n"
     )
 }
 
@@ -33,7 +34,17 @@ pub struct Config {
     pub max_steps: u32,
     pub system_prompt: String,
     pub tool_timeout_seconds: u64,
+    /// The most raw output `run_bash_command` will ever capture from a
+    /// command's stdout/stderr before Tool Output Compression runs — a
+    /// memory-safety bound, not what the model sees (see `local_model`'s
+    /// module doc). Compression, not this limit, shapes what reaches the
+    /// Context.
     pub tool_output_truncate_chars: usize,
+    /// How long a single Danger Classification or Tool Output Compression
+    /// call to the Local Model may run before it's treated as a failure
+    /// (fail-closed to Approval, or falls back to raw output — see
+    /// `local_model`'s module doc).
+    pub local_model_timeout_seconds: u64,
 }
 
 fn config_path(home: &str) -> PathBuf {
@@ -138,6 +149,7 @@ mod tests {
             system_prompt = "custom prompt"
             tool_timeout_seconds = 1
             tool_output_truncate_chars = 1
+            local_model_timeout_seconds = 1
         "#;
         std::fs::write(&path, custom_toml).unwrap();
 
@@ -166,7 +178,8 @@ mod tests {
                 max_steps: 20,
                 system_prompt: DEFAULT_SYSTEM_PROMPT.to_string(),
                 tool_timeout_seconds: 30,
-                tool_output_truncate_chars: 10_000,
+                tool_output_truncate_chars: 100_000,
+                local_model_timeout_seconds: 30,
             }
         );
     }
@@ -179,6 +192,7 @@ mod tests {
             system_prompt = "You are a helpful assistant."
             tool_timeout_seconds = 30
             tool_output_truncate_chars = 4000
+            local_model_timeout_seconds = 15
         "#;
 
         let config = parse_config(toml, Path::new("/tmp/config.toml")).unwrap();
@@ -191,6 +205,7 @@ mod tests {
                 system_prompt: "You are a helpful assistant.".to_string(),
                 tool_timeout_seconds: 30,
                 tool_output_truncate_chars: 4000,
+                local_model_timeout_seconds: 15,
             }
         );
     }

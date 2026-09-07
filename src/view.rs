@@ -11,7 +11,7 @@ use ratatui::widgets::{
 };
 
 use tib::config::Config;
-use tib::model_client::Role;
+use tib::model_client::{Role, ToolCallRequest};
 use tib::session::{Session, SessionState};
 use tib::token_heuristic::{context_percent_used, free_dots, scaled_message_tokens};
 
@@ -28,17 +28,29 @@ const FREE_DOT: &str = "·";
 /// one of `role_color`'s colors, since free dots belong to no role.
 const FREE_DOT_COLOR: Color = Color::DarkGray;
 
+/// The color a Tool Result's raw pre-compression block is drawn in (see
+/// `ContextMessage::raw_tool_output`) — deliberately distinct from
+/// `role_color`'s Tool red, so the two blocks read as different sections at
+/// a glance.
+const RAW_OUTPUT_COLOR: Color = Color::Magenta;
+
 /// Ephemeral state the Controller owns that isn't part of `Session`: the
 /// input box contents, whether a turn is in flight, the last turn's error
 /// (if any), text streamed so far for the in-progress turn's current step
-/// (not yet folded into `Session`), and how far the transcript is manually
-/// scrolled up from the bottom (`None` means pinned to the bottom).
+/// (not yet folded into `Session`), how far the transcript is manually
+/// scrolled up from the bottom (`None` means pinned to the bottom), whether
+/// the Local Model is still starting up or ended up in Degraded Mode, and
+/// one Tool Call paused at Awaiting Approval, if any (its command and the
+/// Danger Classification's reason).
 pub struct ControllerState<'a> {
     pub input: &'a str,
     pub processing: bool,
     pub error_banner: Option<&'a str>,
     pub streaming_text: Option<&'a str>,
     pub scroll_offset: Option<u16>,
+    pub local_model_loading: bool,
+    pub local_model_degraded: bool,
+    pub pending_approval: Option<(&'a ToolCallRequest, &'a str)>,
 }
 
 /// The shared role→color mapping used by both the transcript pane and the
@@ -137,18 +149,18 @@ fn truncate_for_display(lines: Vec<String>) -> Vec<String> {
     truncated
 }
 
-/// One message's lines, each prefixed with a role-colored gutter marker; the
-/// message text itself stays in the terminal's default color. `text` is
-/// wrapped to `width` characters first (see `wrap_line`); for a Tool
-/// message, the wrapped rows are then capped at `TOOL_OUTPUT_DISPLAY_LIMIT`
-/// (see `truncate_for_display`) — display only, never sent to the model.
-fn message_lines(role: Role, text: &str, width: usize) -> Vec<Line<'static>> {
-    let gutter_style = Style::default().fg(role_color(role));
+/// One block's lines, each prefixed with a `color`-styled gutter marker; the
+/// text itself stays in the terminal's default color. `text` is wrapped to
+/// `width` characters first (see `wrap_line`); when `cap_display` is set,
+/// the wrapped rows are then capped at `TOOL_OUTPUT_DISPLAY_LIMIT` (see
+/// `truncate_for_display`) — display only, never sent to the model.
+fn message_lines(color: Color, text: &str, width: usize, cap_display: bool) -> Vec<Line<'static>> {
+    let gutter_style = Style::default().fg(color);
     let wrapped: Vec<String> = text
         .lines()
         .flat_map(|line| wrap_line(line, width))
         .collect();
-    let wrapped = if matches!(role, Role::Tool) {
+    let wrapped = if cap_display {
         truncate_for_display(wrapped)
     } else {
         wrapped
@@ -167,7 +179,11 @@ fn message_lines(role: Role, text: &str, width: usize) -> Vec<Line<'static>> {
 /// The transcript's lines: one blank separator line between each message
 /// (including a trailing in-progress `streaming_text`, if any) so sections
 /// are visually distinct. `width` is the available character width for
-/// message text, i.e. excluding the gutter marker (see `message_lines`).
+/// message text, i.e. excluding the gutter marker (see `message_lines`). A
+/// Tool Result with a distinct raw pre-compression text (see
+/// `ContextMessage::raw_tool_output`) renders that first, in
+/// `RAW_OUTPUT_COLOR`, as its own capped block above the normal one — see
+/// `CONTEXT.md`'s Tool Output Compression.
 fn transcript_lines(
     session: &Session,
     streaming_text: Option<&str>,
@@ -179,10 +195,21 @@ fn transcript_lines(
         if !lines.is_empty() {
             lines.push(Line::default());
         }
+        if let Some(raw) = message.raw_tool_output() {
+            lines.extend(message_lines(
+                RAW_OUTPUT_COLOR,
+                &format!("raw output:\n{raw}"),
+                width,
+                true,
+            ));
+            lines.push(Line::default());
+        }
+        let role = message.role();
         lines.extend(message_lines(
-            message.role(),
+            role_color(role),
             &message.display_text(),
             width,
+            matches!(role, Role::Tool),
         ));
     }
 
@@ -190,7 +217,12 @@ fn transcript_lines(
         if !lines.is_empty() {
             lines.push(Line::default());
         }
-        lines.extend(message_lines(Role::Assistant, text, width));
+        lines.extend(message_lines(
+            role_color(Role::Assistant),
+            text,
+            width,
+            false,
+        ));
     }
 
     lines
@@ -262,6 +294,8 @@ const fn state_label(state: &SessionState) -> &'static str {
         SessionState::AwaitingUserInput => "awaiting input",
         SessionState::CallingModel { .. } => "calling model…",
         SessionState::ExecutingTools { .. } => "executing tools…",
+        SessionState::AwaitingApproval { .. } => "awaiting approval…",
+        SessionState::CompressingOutput { .. } => "compressing output…",
     }
 }
 
@@ -273,8 +307,12 @@ fn is_current_phase(target: &SessionState, current: &SessionState) -> bool {
     std::mem::discriminant(target) == std::mem::discriminant(current)
 }
 
-/// The state machine as one line — `CONTEXT.md`'s three Loop phases in
-/// order, with `current`'s label underlined.
+/// The state machine as one line: User, LLM, and Tool are wired to their
+/// matching `SessionState` and underline when current; Approve and Compress
+/// are shown as upcoming phases (`CONTEXT.md`'s Awaiting Approval and Tool
+/// Output Compression) and will gain live underlining once their
+/// `SessionState` variants land with the approval/compression feature. Only
+/// each label's text is ever styled — the arrows between them stay plain.
 fn state_oneliner(current: &SessionState) -> Line<'static> {
     let label = |text: &'static str, target: &SessionState| {
         let style = if is_current_phase(target, current) {
@@ -286,25 +324,65 @@ fn state_oneliner(current: &SessionState) -> Line<'static> {
     };
 
     Line::from(vec![
-        label("Awaiting Input", &SessionState::AwaitingUserInput),
+        label("User", &SessionState::AwaitingUserInput),
         Span::raw(" → "),
-        label("Calling Model", &SessionState::CallingModel { step: 0 }),
+        label("LLM", &SessionState::CallingModel { step: 0 }),
         Span::raw(" ↔ "),
         label(
-            "Executing Tools",
+            "Tool",
             &SessionState::ExecutingTools {
                 step: 0,
                 pending: Vec::new(),
                 results: Vec::new(),
             },
         ),
+        Span::raw(" → "),
+        label(
+            "Approve",
+            &SessionState::AwaitingApproval {
+                step: 0,
+                tool_call: ToolCallRequest {
+                    id: String::new(),
+                    command: String::new(),
+                },
+                reason: String::new(),
+            },
+        ),
+        Span::raw(" → "),
+        label(
+            "Compress",
+            &SessionState::CompressingOutput {
+                step: 0,
+                tool_call_id: String::new(),
+            },
+        ),
     ])
+}
+
+fn local_model_status_line(controller: &ControllerState<'_>) -> Line<'static> {
+    if controller.local_model_loading {
+        Line::from(Span::styled(
+            "local model: loading…",
+            Style::default().fg(Color::DarkGray),
+        ))
+    } else if controller.local_model_degraded {
+        Line::from(Span::styled(
+            "local model: unavailable (degraded — every command needs approval)",
+            Style::default().fg(Color::Red),
+        ))
+    } else {
+        Line::from(Span::styled(
+            "local model: ready",
+            Style::default().fg(Color::DarkGray),
+        ))
+    }
 }
 
 fn info_lines(
     session: &Session,
     config: &Config,
     context_length: Option<u32>,
+    controller: &ControllerState<'_>,
 ) -> Vec<Line<'static>> {
     let cost = session
         .last_usage
@@ -319,6 +397,7 @@ fn info_lines(
         Line::from(format!("step: {}/{}", session.step_count, config.max_steps)),
         Line::from(format!("tool calls: {}", session.tool_call_count)),
         Line::from(format!("last call cost: {cost}")),
+        local_model_status_line(controller),
         state_oneliner(&session.state),
         Line::from(""),
         Line::from(format!(
@@ -395,11 +474,17 @@ pub fn render(
         .end_symbol(None);
     frame.render_stateful_widget(scrollbar, transcript_area, &mut scrollbar_state);
 
-    let input_title = match session.state {
-        SessionState::AwaitingUserInput => "Message".to_string(),
-        ref state => format!("Message ({})", state_label(state)),
+    let input_title = if controller.pending_approval.is_some() {
+        "Approve? (y/n)".to_string()
+    } else {
+        match session.state {
+            SessionState::AwaitingUserInput => "Message".to_string(),
+            ref state => format!("Message ({})", state_label(state)),
+        }
     };
-    let input_style = if controller.error_banner.is_some() {
+    let input_style = if controller.pending_approval.is_some() {
+        Style::default().fg(Color::Yellow)
+    } else if controller.error_banner.is_some() {
         Style::default().fg(Color::Red)
     } else {
         Style::default()
@@ -420,15 +505,19 @@ pub fn render(
                 .saturating_sub(visible_chars),
         )
         .collect();
-    let input_text = controller
-        .error_banner
-        .map_or_else(|| visible_input, |error| format!("error: {error}"));
+    let input_text = if let Some((tool_call, reason)) = controller.pending_approval {
+        format!("{} — {reason}", tool_call.command)
+    } else {
+        controller
+            .error_banner
+            .map_or_else(|| visible_input, |error| format!("error: {error}"))
+    };
     let input_paragraph = Paragraph::new(input_text)
         .style(input_style)
         .block(Block::default().borders(Borders::ALL).title(input_title));
     frame.render_widget(input_paragraph, input_area);
 
-    let info = Paragraph::new(info_lines(session, config, context_length))
+    let info = Paragraph::new(info_lines(session, config, context_length, controller))
         .block(Block::default().borders(Borders::ALL).title("Info"))
         .wrap(Wrap { trim: false });
     frame.render_widget(info, info_area);

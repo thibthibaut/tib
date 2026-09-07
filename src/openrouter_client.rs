@@ -59,6 +59,7 @@ fn to_openrouter_message(message: &ContextMessage) -> Message {
         ContextMessage::ToolResult {
             tool_call_id,
             content,
+            raw: _,
         } => Message::tool_response(tool_call_id, content.clone()),
     }
 }
@@ -348,6 +349,7 @@ mod tests {
         let tool_result = to_openrouter_message(&ContextMessage::ToolResult {
             tool_call_id: "call_1".to_string(),
             content: "exit_code: 0".to_string(),
+            raw: None,
         });
 
         assert_eq!(tool_result.role, Role::Tool);

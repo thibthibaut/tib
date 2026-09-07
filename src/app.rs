@@ -13,11 +13,12 @@ use std::time::{Duration, Instant};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use eyre::Result;
 use ratatui::{DefaultTerminal, Frame};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::{JoinError, JoinHandle, LocalSet};
 
 use tib::config::Config;
-use tib::model_client::{ContextMessage, ModelClient, Usage};
+use tib::local_model::LocalModel;
+use tib::model_client::{ContextMessage, ModelClient, ToolCallRequest, Usage};
 use tib::session::{Session, SessionState, TurnEvent};
 
 use crate::view::{self, ControllerState};
@@ -47,7 +48,27 @@ enum AppEvent {
         tool_call_count: u32,
         last_usage: Option<Usage>,
     },
+    /// A Tool Call needs the user's y/n Approval (see `CONTEXT.md`) — mirrors
+    /// [`TurnEvent::ApprovalNeeded`].
+    ApprovalNeeded {
+        tool_call: ToolCallRequest,
+        reason: String,
+        respond: oneshot::Sender<bool>,
+    },
     TurnFinished(Result<()>),
+    /// The Local Model finished loading (or failed to — see `CONTEXT.md`'s
+    /// Degraded Mode), from the background task `spawn_local_model_load`
+    /// starts at startup.
+    LocalModelLoaded(Option<Arc<LocalModel>>),
+}
+
+/// One Tool Call paused at Awaiting Approval, waiting on the user's y/n
+/// answer — `respond` resumes the Turn once answered (see
+/// [`AppEvent::ApprovalNeeded`]).
+struct PendingApproval {
+    tool_call: ToolCallRequest,
+    reason: String,
+    respond: oneshot::Sender<bool>,
 }
 
 /// Polls terminal input on a background thread (crossterm's event reading is
@@ -98,14 +119,15 @@ fn scroll_down(offset: Option<u16>, delta: u16) -> Option<u16> {
 }
 
 /// Spawns the current Turn (already started via `Session::push_user_message`)
-/// as a `LocalSet` task: drives `session` forward via `client`/`config`,
-/// forwarding each `TurnEvent` as a matching `AppEvent` on `tx` as it
-/// arrives, then reports completion as an `AppEvent::TurnFinished`.
+/// as a `LocalSet` task: drives `session` forward via `client`/`config`/
+/// `local_model`, forwarding each `TurnEvent` as a matching `AppEvent` on
+/// `tx` as it arrives, then reports completion as an `AppEvent::TurnFinished`.
 #[allow(clippy::future_not_send)] // see `run`'s doc comment
 fn spawn_turn<C>(
     session: Arc<Mutex<Session>>,
     client: Arc<C>,
     config: Arc<Config>,
+    local_model: Option<Arc<LocalModel>>,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) -> JoinHandle<()>
 where
@@ -116,27 +138,61 @@ where
         let result = {
             let mut session = session.lock().await;
             session
-                .run_turn(client.as_ref(), config.as_ref(), move |event| {
-                    let app_event = match event {
-                        TurnEvent::Text(text) => AppEvent::StreamChunk(text),
-                        TurnEvent::StateChanged(state) => AppEvent::StateChanged(state),
-                        TurnEvent::MessageAppended(message) => AppEvent::MessageAppended(message),
-                        TurnEvent::CountersChanged {
-                            step_count,
-                            tool_call_count,
-                            last_usage,
-                        } => AppEvent::CountersChanged {
-                            step_count,
-                            tool_call_count,
-                            last_usage,
-                        },
-                    };
-                    let _unused = event_tx.send(app_event);
-                })
+                .run_turn(
+                    client.as_ref(),
+                    config.as_ref(),
+                    local_model.as_deref(),
+                    move |event| {
+                        let app_event = match event {
+                            TurnEvent::Text(text) => AppEvent::StreamChunk(text),
+                            TurnEvent::StateChanged(state) => AppEvent::StateChanged(state),
+                            TurnEvent::MessageAppended(message) => {
+                                AppEvent::MessageAppended(message)
+                            }
+                            TurnEvent::CountersChanged {
+                                step_count,
+                                tool_call_count,
+                                last_usage,
+                            } => AppEvent::CountersChanged {
+                                step_count,
+                                tool_call_count,
+                                last_usage,
+                            },
+                            TurnEvent::ApprovalNeeded {
+                                tool_call,
+                                reason,
+                                respond,
+                            } => AppEvent::ApprovalNeeded {
+                                tool_call,
+                                reason,
+                                respond,
+                            },
+                        };
+                        let _unused = event_tx.send(app_event);
+                    },
+                )
                 .await
         };
         let _unused = tx.send(AppEvent::TurnFinished(result));
     })
+}
+
+/// Spawns the Local Model's load (see `CONTEXT.md`) as a background
+/// `LocalSet` task, reporting the outcome as an `AppEvent::LocalModelLoaded`
+/// once it's done — `None` on any failure (missing `HOME`, load error, or a
+/// failed self-test), which the Controller treats as Degraded Mode rather
+/// than a startup failure (see `CONTEXT.md`'s Degraded Mode).
+fn spawn_local_model_load(timeout_seconds: u64, tx: mpsc::UnboundedSender<AppEvent>) {
+    tokio::task::spawn_local(async move {
+        let local_model = match std::env::var("HOME") {
+            Ok(home) => LocalModel::load(&home, Duration::from_secs(timeout_seconds))
+                .await
+                .ok()
+                .map(Arc::new),
+            Err(_) => None,
+        };
+        let _unused = tx.send(AppEvent::LocalModelLoaded(local_model));
+    });
 }
 
 /// Runs the app: connects `client`, shows the three-pane layout, and drives
@@ -202,6 +258,17 @@ struct AppState<C> {
     // `TurnFinished` event is only sent on normal completion) still resolves
     // the turn via its `JoinError`.
     turn_handle: Option<JoinHandle<()>>,
+    /// `None` until `AppEvent::LocalModelLoaded` arrives; after that, `Some`
+    /// once loaded, or permanently `None` in Degraded Mode (see
+    /// `CONTEXT.md`). Cloned into each spawned turn.
+    local_model: Option<Arc<LocalModel>>,
+    /// True from startup until `AppEvent::LocalModelLoaded` arrives — shown
+    /// as a loading indicator (see `CONTEXT.md`'s design decision not to
+    /// block the UI on this).
+    local_model_loading: bool,
+    /// A Tool Call paused at Awaiting Approval, waiting on the user's y/n
+    /// answer (see `CONTEXT.md`).
+    pending_approval: Option<PendingApproval>,
 }
 
 impl<C> AppState<C>
@@ -213,6 +280,7 @@ where
         let client = Arc::new(client);
         let session = Arc::new(Mutex::new(Session::new(config.system_prompt.clone())));
         let display = session.lock().await.clone();
+        spawn_local_model_load(config.local_model_timeout_seconds, tx.clone());
         Self {
             session,
             client,
@@ -225,6 +293,9 @@ where
             scroll_offset: None,
             display,
             turn_handle: None,
+            local_model: None,
+            local_model_loading: true,
+            pending_approval: None,
         }
     }
 
@@ -236,6 +307,12 @@ where
             streaming_text: (!self.streaming_text.is_empty())
                 .then_some(self.streaming_text.as_str()),
             scroll_offset: self.scroll_offset,
+            local_model_loading: self.local_model_loading,
+            local_model_degraded: !self.local_model_loading && self.local_model.is_none(),
+            pending_approval: self
+                .pending_approval
+                .as_ref()
+                .map(|pending| (&pending.tool_call, pending.reason.as_str())),
         };
         let max_scroll = view::render(
             frame,
@@ -271,6 +348,22 @@ where
             }
             KeyCode::PageDown => self.scroll_offset = scroll_down(self.scroll_offset, SCROLL_PAGE),
             _ => {
+                // A pending Approval takes over the keyboard until answered,
+                // even ahead of the `processing` gate below (a Turn paused at
+                // Awaiting Approval is still `processing`) — otherwise y/n
+                // could never reach it.
+                if let Some(pending) = self.pending_approval.take() {
+                    match key.code {
+                        KeyCode::Char('y' | 'Y') => {
+                            let _unused = pending.respond.send(true);
+                        }
+                        KeyCode::Char('n' | 'N') => {
+                            let _unused = pending.respond.send(false);
+                        }
+                        _ => self.pending_approval = Some(pending),
+                    }
+                    return false;
+                }
                 if self.processing {
                     return false;
                 }
@@ -293,6 +386,7 @@ where
                             Arc::clone(&self.session),
                             Arc::clone(&self.client),
                             Arc::clone(&self.config),
+                            self.local_model.clone(),
                             self.tx.clone(),
                         ));
                     }
@@ -387,7 +481,22 @@ where
                         state.display.tool_call_count = tool_call_count;
                         state.display.last_usage = last_usage;
                     }
+                    AppEvent::ApprovalNeeded {
+                        tool_call,
+                        reason,
+                        respond,
+                    } => {
+                        state.pending_approval = Some(PendingApproval {
+                            tool_call,
+                            reason,
+                            respond,
+                        });
+                    }
                     AppEvent::TurnFinished(result) => state.on_turn_finished(result),
+                    AppEvent::LocalModelLoaded(local_model) => {
+                        state.local_model = local_model;
+                        state.local_model_loading = false;
+                    }
                 }
             }
         }

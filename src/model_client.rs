@@ -32,7 +32,17 @@ pub enum ContextMessage {
     },
     ToolResult {
         tool_call_id: String,
+        /// What the model actually sees: metadata (`exit_code`/`timed_out`)
+        /// plus either Tool Output Compression's result or, when
+        /// compression didn't run or fell back, the raw captured text.
         content: String,
+        /// The raw captured text, kept only when it differs from what
+        /// `content` ended up holding (i.e. compression actually changed
+        /// it) — display-only, per `CONTEXT.md`'s Tool Output Compression;
+        /// never sent to the model. `None` when compression was skipped,
+        /// failed, or the output was empty, so the transcript doesn't
+        /// render a pointless duplicate of `content`.
+        raw: Option<String>,
     },
 }
 
@@ -64,6 +74,18 @@ impl ContextMessage {
                 lines.join("\n")
             }
             Self::ToolResult { content, .. } => content.clone(),
+        }
+    }
+
+    /// The raw pre-compression text of a Tool Result, when it differs from
+    /// `content` (see the field doc on [`ContextMessage::ToolResult::raw`]).
+    /// `None` for every other message role, and for a Tool Result with
+    /// nothing distinct to show.
+    #[must_use]
+    pub fn raw_tool_output(&self) -> Option<&str> {
+        match self {
+            Self::ToolResult { raw, .. } => raw.as_deref(),
+            Self::System(_) | Self::User(_) | Self::Assistant { .. } => None,
         }
     }
 }
@@ -172,6 +194,7 @@ mod tests {
                 ContextMessage::ToolResult {
                     tool_call_id: "call_1".to_string(),
                     content: "output".to_string(),
+                    raw: None,
                 },
                 ContextMessage::User("second".to_string()),
             ],
